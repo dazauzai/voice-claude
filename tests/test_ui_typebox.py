@@ -93,6 +93,7 @@ class TypeBoxTests(unittest.TestCase):
             if self.app.card is not None:
                 break
         self.assertIsNotNone(self.app.card)
+        time.sleep(0.05)  # what is typed next comes strictly after the card, even on a 15.6 ms Windows clock
         return t, out
 
     def test_a_typed_yes_or_no_answers_the_request(self):
@@ -133,7 +134,7 @@ class TypeBoxTests(unittest.TestCase):
     def test_text_typed_before_the_card_is_not_an_answer(self):
         box = self.app.typebox
         self.edit_box("好的")
-        time.sleep(0.02)
+        time.sleep(0.05)
         t, out = self.ask()
         box._enter(SimpleNamespace(state=0))
         self.assertFalse(out)
@@ -147,7 +148,7 @@ class TypeBoxTests(unittest.TestCase):
     def test_a_message_begun_before_the_card_and_finished_after_is_not_an_answer(self):
         box = self.app.typebox
         self.edit_box("等它跑完再")
-        time.sleep(0.02)
+        time.sleep(0.05)
         t, out = self.ask()
         box.text.insert("end", "提交")
         self.pump()
@@ -265,7 +266,7 @@ class TypeBoxTests(unittest.TestCase):
     def test_writing_over_old_text_after_the_card_answers_it(self):
         box = self.app.typebox
         self.edit_box("好的")
-        time.sleep(0.02)
+        time.sleep(0.05)
         t, out = self.ask()
         box.text.delete("1.0", "end")
         box.text.insert("1.0", "可以")  # select all, type over: never empty in between
