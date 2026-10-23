@@ -1,0 +1,127 @@
+# voice-claude 配置。改完保存，重新启动程序生效。
+
+[hotkey]
+# 主键：单按 = 单次模式开始/结束（它说话时单按 = 打断；有申请卡时 = 不行），双按 = 进入/退出对话模式，按住 = 紧急停止。
+# 可选：right ctrl, left ctrl, pause, scroll lock, f13 … f24（都是单独按下没有副作用的键）。
+# Shift 不行（输入法切中/英，连按 5 次还会弹出粘滞键）；Caps Lock 不行（切大写）；Alt 不行（激活菜单栏）；Insert 不行（改写模式）。
+# 文字值要加英文引号。
+key = "right ctrl"
+# 第二个键：单按 = 麦克风静音 / 恢复（有申请卡时 = 可以），双按 = 打断当前这一轮并把排队的话马上发过去。留空 "" 就不用。
+# 单独按 Alt 本来会激活前台程序的菜单栏，voice-claude 按住时会屏蔽这一下；不想用 Alt 可以换成 pause 或 scroll lock。
+send_key = "right alt"
+double_tap_seconds = 0.4
+# 按住这个键不放多少秒 = 紧急刹车：立刻停掉朗读、当前这一轮和正在跑的工具调用。
+hold_seconds = 0.8
+
+[audio]
+# 留空 = 用 Windows 默认设备。也可以填设备名字的一部分，比如 "USB"、"Realtek"、"Headset"。
+# 启动时窗口里会显示当前用的是哪个麦克风和扬声器；听不到声音就先看那一行。
+microphone = ""
+speaker = ""
+# 对话模式里，停顿多少秒算你说完了。说话爱停顿就调大一点。
+silence_seconds = 2.0
+# 戴耳机时，Claude 说话过程中你一开口它就会停下来听。用外放请改成 false，否则它会被自己的声音打断。
+barge_in = true
+# 开口说话多少秒后先把它的声音压低，再过多少秒把声音停掉。它手上的活不会停，你说的话会排队等它做完。
+duck_seconds = 0.3
+cut_seconds = 1.5
+
+[daemon]
+# 后台服务：总机和各条线路都住在这个独立的进程里，语音程序关掉重开都不影响它。
+port = 0            # 0 = 随机端口
+max_lines = 3       # 同时开几条线路（总机不算），超过就把最久没用的关掉（随时能接回来）
+idle_minutes = 10   # 切走后，一条线闲置多少分钟关掉
+start_with = "manager"  # 开机先接谁："manager" = 总机，或者填一个项目名直接进去
+
+[manager]
+# 总机只做转接，用快而便宜的模型就够了；它不绑死任何一家。
+# engine："auto" = 能连上 Claude Code 就用它，否则用不需要模型的"规则总机"（只认固定说法：项目名、新建项目、后台怎么样了）；
+#        "claude" / "rules" 强制其一。
+engine = "auto"
+model = "sonnet"
+effort = "low"
+
+[claude]
+# Claude Code 用的模型：opus / sonnet，或完整型号名。
+model = "opus"
+# 思考深度：low 回答最快（开放性问题 3 秒左右开始说，默认档要 20 秒）；让它干复杂的活时可以改成 medium 或 high。
+effort = "low"
+# Claude 干活时的工作目录。"~" 是你的用户主目录。
+working_directory = "~"
+# Claude Code 命令。一般不用改；找不到时填完整路径。
+command = "claude"
+
+[providers]
+# 谁来答话："claude"（Anthropic：自己登录的 Claude Code 或 API key）、"deepseek"、"kimi"、"openai"（GPT：登录了 Codex 就用
+# ChatGPT 订阅、引擎是 Codex；否则用 API key，引擎是 Claude Code + LiteLLM）。其余几家都由 Claude Code 当引擎。
+# key 在「AI 服务商」页填（存在 ~/.voice-claude/auth.json，不在这里）。口头"切到 DeepSeek / 换成 GPT / 用 Claude"会先问你。
+default = "claude"
+
+[providers.deepseek]
+# 直连 DeepSeek 自己的 Anthropic 兼容接口。模型名以 api-docs.deepseek.com 为准（2026-10：deepseek-flash、deepseek-v4-pro）。
+model = "deepseek-flash"                                       # 线路和总机用的
+models = { flash = "deepseek-flash", pro = "deepseek-v4-pro" } # 口头"切到 pro"能认的名字
+thinking = true                                                # false = 关掉思考模式，回答更快（语音问答可以试试）
+
+[providers.kimi]
+# 直连月之暗面的 Anthropic 兼容接口（platform.kimi.com 的 Claude Code 指南就是这么配的）。海外账号把 base_url 改成 https://api.moonshot.ai/anthropic。
+model = "kimi-k3[1m]"                                          # [1m] = 100 万 token 上下文
+small_model = "kimi-k2.7-code"                                 # 它的思考模式关不掉：把 thinking 设成 false 时请换成 "kimi-k2.6"
+models = { k3 = "kimi-k3[1m]", code = "kimi-k2.7-code", "k2.6" = "kimi-k2.6" }
+# base_url = "https://api.moonshot.ai/anthropic"
+
+[providers.openai]
+# 两种接入：装了 Codex 并 codex login（用你的 ChatGPT 订阅，Codex 当引擎，我们不碰令牌）优先；
+# 否则填 OpenAI 的 key，经本机的 LiteLLM 翻译层（.venv\Scripts\python -m pip install "litellm[proxy]>=1.106.2"），只听 127.0.0.1、只拿到这一把 key。
+model = "gpt-6.1-sol"
+small_model = "gpt-6-luna"                                     # Claude Code 自己的小活（起标题、子代理）用的
+models = { sol = "gpt-6.1-sol", luna = "gpt-6-luna" }
+
+[tts]
+# 朗读用的声音编号（0–102）。运行 `python -m voiceclaude.voices 3 18 30 50` 可以试听。
+voice = 3
+# 语速，1.0 正常，1.2 快一点。
+speed = 1.0
+
+[permissions]
+# 每一项都可以是 "ask"（每次口头问你）、"allow"（不用问）或 "deny"（禁止）。
+# 也可以口头改："把截图权限改成不用问"——改权限本身会先口头向你确认。"现在的权限设置是什么"可以查。
+screenshot = "ask"        # 看屏幕
+click = "ask"             # 点击
+type = "ask"              # 输入文字
+hotkey = "ask"            # 按快捷键
+scroll = "ask"            # 滚动
+open_app = "ask"          # 打开程序
+switch_model = "ask"      # 切换模型
+switch_provider = "ask"   # 换一家厂商来答话（Claude / DeepSeek / Kimi / GPT）
+codex_shell = "ask"       # GPT 走 Codex 引擎时：它想在沙箱外运行命令或联网
+codex_edit = "ask"        # GPT 走 Codex 引擎时：它想改工作区以外的文件
+# 通透模式：true 时上面所有"每次问"的动作都直接执行，不再问；只有删除东西、覆盖已有文件仍会问（由程序判断，不靠模型自觉）。
+# 设为 deny 的照样禁止。口头"打开通透模式"会先向你确认，"关闭通透模式"立即生效。
+transparent = false
+batch = "allow"           # 一次批准一串步骤（"打开记事本并输入 hello，可以吗"问一次做两步）
+other_connectors = "deny" # 挂不挂你账号里的其他连接器（Docs、Drive、Chrome 插件）。它们动起来不经过申请。改这一项要重连 Claude，对话会保留。
+background_job = "ask"    # 把长任务（下载、编译、长脚本）放到后台脱离运行
+
+[ui]
+# 窗口文字大小。也可以点窗口上的 A- / A+，或者口头说"字号放大两个号"。
+font_size = 11
+# 按钮下面那一行快捷键提示。熟了可以点行尾的"隐藏"关掉（就是改这一项），设置页里能再打开。
+show_hints = true
+
+[desktop]
+# 桌面控制：让 Claude 能看屏幕、点鼠标、输入文字、按快捷键、打开程序。
+# 每一个动作执行前它都会口头问你"我想……，可以吗？"，你说"可以"才做，说"不行"就不做。按一下右 Ctrl 也等于"不行"。
+# 鼠标甩到屏幕左上角可以让它的动作立刻中止。不想要这个功能就改成 false。
+enabled = true
+
+[desktop.apps]
+# "打开程序"只认一张清单。自带：记事本、计算器、画图、文件管理器、浏览器（Chrome）、edge、终端、设置、vs code。
+# 这里可以加自己的：左边是你叫它的名字，右边是命令或完整路径。例如
+# "笔记" = "C:\\Users\\you\\Documents\\notes.xlsx"
+# "excel" = "excel"
+
+[replacements]
+# 语音识别常见的错词 → 正确写法。左边不区分大小写。
+"Cloud" = "Claude"
+"cloud code" = "Claude Code"

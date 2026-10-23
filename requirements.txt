@@ -1,0 +1,6 @@
+sherpa-onnx>=1.13
+numpy
+sounddevice
+mcp>=2
+pyautogui
+pillow

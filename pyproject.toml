@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-claude"
+version = "0.1.0"
+description = "Talk to Claude Code (and other models) by voice on Windows: Mandarin + English, speech in and out fully local, every action approved out loud."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "voice-claude contributors" }]
+keywords = ["voice", "speech", "claude", "claude-code", "assistant", "accessibility", "windows"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Win32 (MS Windows)",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Natural Language :: Chinese (Simplified)",
+    "Natural Language :: English",
+]
+dependencies = [
+    "sherpa-onnx>=1.13",
+    "numpy",
+    "sounddevice",
+    "mcp>=2",
+    "pyautogui",
+    "pillow",
+]
+
+[project.optional-dependencies]
+# Users without the official Claude Code install: the SDK ships a copy of it (about 130 MB).
+bundled-claude = ["claude-agent-sdk"]
+# GPT (OpenAI) with an API key answers through a local LiteLLM proxy translating Anthropic Messages -> Chat
+# Completions (not needed for the ChatGPT login through Codex). Lower bound well past the 1.82.7 / 1.82.8 supply-chain incident of March 2026.
+openai = ["litellm[proxy]>=1.106.2"]
+
+# Run voice-claude from a git checkout (install.bat, run.bat): it reads config.example.toml, models/ and scripts/
+# next to the package, so installing the package on its own (pip install from an index or a git URL) is not
+# supported and no console commands are declared.
+
+[project.urls]
+Homepage = "https://github.com/dazauzai/voice-claude"
+Documentation = "https://github.com/dazauzai/voice-claude#readme"
+
+[tool.setuptools]
+packages = ["voiceclaude"]
+include-package-data = false

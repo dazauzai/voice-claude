@@ -1,0 +1,24 @@
+*.log
+.venv/
+__pycache__/
+frontend_harness.log
+mcp-config.json
+models/
+preview.png
+*.out
+
+# personal settings and keys live in ~/.voice-claude, never in the repo
+config.toml
+auth.json
+
+# build
+build/
+dist/
+*.egg-info/
+
+# editors and tools
+.claude/
+.vscode/
+.idea/
+.pytest_cache/
+.env

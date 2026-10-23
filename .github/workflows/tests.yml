@@ -1,0 +1,29 @@
+name: tests
+
+# Unit tests only: no speech models, no microphone, no model service, no keys. (The full self-test starts real
+# processes and uses a real model; it is run by hand, see CONTRIBUTING.md.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -r requirements.txt
+      - name: Unit tests
+        env:
+          VOICECLAUDE_NO_HOTKEY: "1"
+          PYTHONUTF8: "1"
+        run: python -X utf8 -m unittest discover -s tests -v
