@@ -340,7 +340,10 @@ def find_claude_binary(command: str = "claude") -> str | None:
 
 
 def auth_status(claude: str, timeout: float = 15.0) -> dict | None:
-    """`claude auth status` as a dict (loggedIn, authMethod, email, subscriptionType), or None if unknown."""
+    """`claude auth status` as a dict (loggedIn, authMethod, email, subscriptionType), or None if unknown. Never under
+    a unit-test runner: a test must not start the machine's real Claude Code (tests pass their own `status`)."""
+    if testing.under_test_runner():
+        return None
     try:
         r = subprocess.run([claude, "auth", "status"], capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=timeout, creationflags=CREATE_NO_WINDOW)

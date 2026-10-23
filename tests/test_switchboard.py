@@ -100,9 +100,11 @@ class SwitchboardTests(unittest.TestCase):
                 self.calls.append("start")
                 slow.append(self)  # no 'ready' yet
 
+        from voiceclaude import access
         sb = Switchboard(self.cfg, jobs=self.jobs, emit=lambda k, d: self.events.append((k, d)),
                          forward=lambda p, d: {"ok": True}, session_factory=SlowSession,
-                         scan_projects=lambda: list(self.projects), now=lambda: self.clock[0], ask_timeout=0.3)
+                         scan_projects=lambda: list(self.projects), now=lambda: self.clock[0], ask_timeout=0.3,
+                         detect_access=lambda cmd: access.AccessStatus(True, "subscription", "测试"))  # never the real machine's
         self.events.clear()
         sb.start()
         self.assertEqual(sb.greeting(), "我是总机，要去哪个项目？")
