@@ -18,6 +18,7 @@ class FakeClient:
         self.active = "p-1"
         self.info = {}
         self.shutdowns = []
+        self.confirmed = []
         self.shutdown_reply = shutdown_reply or {"ok": True, "message": "后台服务正在关闭"}
         self.said = []
         self.phrases = []
@@ -26,8 +27,9 @@ class FakeClient:
         self.phrases.append(key)
         return {"ok": True, "spoken": ""}
 
-    def shutdown(self, jobs="ask"):
+    def shutdown(self, jobs="ask", lines_confirmed=False):
         self.shutdowns.append(jobs)
+        self.confirmed.append(lines_confirmed)
         return self.shutdown_reply
 
     def say(self, line, text):
@@ -230,6 +232,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(asked, ["Atlas 正在回答。\n仍要退出吗？"])
         self.assertTrue(self.wait(lambda: client.shutdowns))
         self.assertEqual(client.shutdowns, ["ask"])
+        self.assertEqual(client.confirmed, [True])  # asked here already: the service must not ask again
         # the service's bye closes the window, without the error tone; the client's own second bye is ignored
         self.app._on_daemon("bye", {"reason": "后台服务已关闭"})
         self.app._on_daemon("bye", {"reason": "后台服务的连接断了"})

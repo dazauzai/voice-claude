@@ -45,15 +45,25 @@ class FakeAppServer:
             self._emit("thread/started", {"thread": {"id": "thread-new"}})
         elif m == "thread/resume":
             self.resumed = msg["params"]["threadId"]
+            if self.script.pop("resume_dies", False):
+                self.close()  # the app-server exits by itself before it answers (a real EOF)
+                return
+            if self.script.pop("resume_hangs", False):
+                return  # this app-server dies before it answers (the test closes it)
             if self.script.get("resume_fails"):
                 self.out.put(json.dumps({"id": rid, "error": {"code": 1, "message": "no such thread"}}))
             else:
-                self._reply(rid, {"thread": {"id": msg["params"]["threadId"]}})
+                self._reply(rid, {"thread": {"id": msg["params"]["threadId"], "turns": [{"id": "turn-a"}, {"id": "turn-b"}]}})
+        elif m == "turn/start" and self.script.pop("turn_dies", False):
+            self.close()  # exits by itself while starting the turn
         elif m == "turn/start":
             self.turns += 1
             tid = f"turn-{self.turns}"
             self._reply(rid, {"turn": {"id": tid, "status": "inProgress"}})
             threading.Thread(target=self._play_turn, args=(tid, msg["params"]), daemon=True).start()
+        elif m == "thread/fork":
+            self.script["fork"] = msg["params"]
+            self._reply(rid, {"thread": {"id": "thread-fork"}})
         elif m == "turn/interrupt":
             self._reply(rid, {})
             self._emit("turn/completed", {"threadId": "t", "turn": {"id": msg["params"]["turnId"], "status": "interrupted"}})
@@ -156,6 +166,124 @@ class CodexSessionTests(unittest.TestCase):
 
     def dones(self):
         return [d for k, d in self.events if k == "done"]
+
+    def test_rewind_forks_the_thread_after_the_kept_turn(self):
+        self.s.start()
+        self.assertTrue(wait_for(lambda: self.s.ready.is_set()))
+        self.s.send("hi")
+        self.assertTrue(wait_for(lambda: self.dones()))
+        self.assertIn(("mark", {"codex_turn": "turn-1"}), self.events)  # the point a later rewind can fork after
+        with self.assertRaises(RuntimeError):
+            self.s.rewind_to({"codex_turn": None}, {})
+        self.s.rewind_to({"codex_turn": "turn-1"}, {"codex_turn": "turn-2"})
+        self.assertEqual(self.script["fork"], {"threadId": "thread-new", "lastTurnId": "turn-1"})
+        self.assertTrue(wait_for(lambda: self.fake.resumed == "thread-fork"))  # the line goes on in the forked thread
+        self.assertTrue(wait_for(lambda: ("ready", {"session_id": "thread-fork", "base_turn": "turn-b"}) in self.events))  # lines.json keeps it
+        self.assertEqual(self.s.session_id, "thread-fork")
+
+    def test_a_sentence_waiting_for_the_thread_fails_as_soon_as_the_app_server_ends(self):
+        """No 90-s wait when the app-server it waits for exits: the send gives up at once with the true reason."""
+        fakes = []
+
+        def factory(a, c, e):
+            fakes.append(FakeAppServer(a, c, e, self.script))
+            return fakes[-1]
+        self.script["resume_hangs"] = True
+        s = CodexSession(self.cfg, "x", lambda k, d: None, line_id="l5", resume="thread-old", exe=r"C:\codex\codex.exe",
+                         transport_factory=factory)
+        s.start()
+        self.assertTrue(wait_for(lambda: fakes and fakes[0].resumed == "thread-old"))
+        out = {}
+        t0 = time.monotonic()
+        waiting = threading.Thread(target=lambda: out.update(r=self._try(s.send, "把 build 目录删掉"), t=time.monotonic() - t0))
+        waiting.start()
+        time.sleep(0.1)
+        fakes[0].close()  # the app-server exits by itself while the sentence waits
+        waiting.join(5)
+        self.assertEqual(out["r"], "Codex 进程已结束，这句没有发出去")
+        self.assertLess(out["t"], 2.0)
+        self.assertEqual(s._wait_ready(s.generation - 1, 5), "gone")  # a retired generation never waits
+        s.close()
+
+    def test_an_app_server_that_exits_during_resume_keeps_the_thread(self):
+        """A real exit (EOF), not our close: the handshake must not take it for a refused resume and start an empty
+        thread, and the exit is reported once."""
+        events, fakes = [], []
+
+        def factory(a, c, e):
+            fakes.append(FakeAppServer(a, c, e, self.script))
+            return fakes[-1]
+        self.script["resume_dies"] = True
+        s = CodexSession(self.cfg, "x", lambda k, d: events.append((k, d)), line_id="l4", resume="thread-old",
+                         exe=r"C:\codex\codex.exe", transport_factory=factory)
+        s.start()
+        self.assertTrue(wait_for(lambda: any(k == "exit" for k, d in events)))
+        time.sleep(0.2)
+        self.assertEqual([k for k, d in events], ["exit"])  # no done from the handshake, one exit
+        self.assertEqual([m.get("method") for m in fakes[0].received].count("thread/start"), 0)
+        self.assertEqual(s.session_id, "thread-old")  # the next words resume it, not an empty one
+        s.restart()
+        self.assertTrue(wait_for(lambda: s.ready.is_set()))
+        self.assertEqual((fakes[-1].resumed, s.session_id), ("thread-old", "thread-old"))
+        s.close()
+
+    def test_a_dead_app_servers_handshake_never_touches_the_next_one(self):
+        """The app-server went away during thread/resume and another came up: the old handshake fails at once and
+        stops, instead of timing out and starting a second, empty thread on the new app-server."""
+        fakes = []
+
+        def factory(a, c, e):
+            fakes.append(FakeAppServer(a, c, e, self.script))
+            return fakes[-1]
+        self.script["resume_hangs"] = True
+        s = CodexSession(self.cfg, "x", lambda k, d: None, line_id="l3", resume="thread-old", exe=r"C:\codex\codex.exe",
+                         transport_factory=factory)
+        s.start()
+        self.assertTrue(wait_for(lambda: fakes and fakes[0].resumed == "thread-old"))
+        sent = {}
+        waiting = threading.Thread(target=lambda: sent.update(r=self._try(s.send, "把 build 目录删掉")), daemon=True)
+        waiting.start()  # the user's sentence waits for ready
+        s.restart()  # the user's next words reconnect it (or a fresh start)
+        self.assertTrue(wait_for(lambda: s.ready.is_set()))
+        waiting.join(3)
+        self.assertIn("没有发出去", sent["r"])  # not sent behind the user's back on the new app-server
+        time.sleep(0.2)
+        new = fakes[-1]
+        self.assertEqual([m.get("method") for m in new.received].count("thread/start"), 0)  # no stray empty thread
+        self.assertEqual([m.get("method") for m in new.received].count("turn/start"), 0)
+        self.assertEqual(s.session_id, "thread-old")
+        s.close()
+
+    @staticmethod
+    def _try(fn, *a):
+        try:
+            fn(*a)
+            return "sent"
+        except RuntimeError as e:
+            return str(e)
+
+    def test_ready_is_told_before_anyone_waiting_for_it_goes_on(self):
+        """The line hears 'ready' (and the resumed thread's last turn) before a send or a rewind waiting for the flag
+        goes on: no turn of ours before the base turn, and no second save racing a rewind's own."""
+        seen = []
+        s = CodexSession(self.cfg, "x", lambda k, d: seen.append((k, s.ready.is_set())) if k == "ready" else None,
+                         line_id="l2", resume="thread-old", exe=r"C:\codex\codex.exe",
+                         transport_factory=lambda a, c, e: FakeAppServer(a, c, e, {}))
+        s.start()
+        self.assertTrue(wait_for(lambda: s.ready.is_set()))
+        self.assertEqual(seen, [("ready", False)])
+        self.assertEqual(s.base_turn, "turn-b")
+        s.close()
+
+    def test_a_fork_that_does_not_come_up_goes_back_to_the_old_thread(self):
+        self.s.start()
+        self.assertTrue(wait_for(lambda: self.s.ready.is_set()))
+        self.s.send("hi")
+        self.assertTrue(wait_for(lambda: self.dones()))
+        self.script["resume_fails"] = True  # thread/resume of the fork fails: the handshake would start an empty thread
+        with mock.patch.object(engine_codex, "READY_TIMEOUT", 3.0), self.assertRaises(RuntimeError):
+            self.s.rewind_to({"codex_turn": "turn-1"}, {})
+        self.assertEqual(self.s.session_id, "thread-new")  # the conversation the line had, not an empty one
 
     def test_args_isolate_our_servers_and_keep_the_users_login(self):
         args = self.s.build_args()

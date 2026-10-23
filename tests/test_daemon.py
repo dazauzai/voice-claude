@@ -211,6 +211,8 @@ class DaemonTests(unittest.TestCase):
     def test_hello_and_status(self):
         c = self.client()
         self.assertEqual(c.active, "manager")
+        self.assertEqual(self.sb.frontend_pid, os.getpid())  # the window's process: the desktop tools never type into it
+        self.assertEqual(self.sb.control_request("manager", "frontend_pid", {})["pid"], os.getpid())
         self.assertEqual({l["line"] for l in c.info["lines"]}, {"manager"})
         s = c.status()
         self.assertTrue(s["ok"])

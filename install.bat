@@ -1,6 +1,11 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+if exist "python\python.exe" (
+  echo 这个版本已经包含运行环境和语音模型，直接双击 run.bat。
+  pause
+  exit /b 0
+)
 rem voice-claude installer: finds Python 3.11+, then runs scripts\install.py (each step is skipped when done).
 rem Options: --mirror (always use the China mirrors)  --no-mirror  --with-gpt  --yes
 

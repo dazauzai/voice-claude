@@ -78,6 +78,15 @@ client.close()                           # 只断开连接；后台服务和线�
 - 线路工具 `set_transparent(on)`（voiceclaude 工具服务器）：开 = 同样先口头确认，关 = 立即。
 - 工具服务器在 `/ask` 里传 `facts`（单步 `{kind, keys|text|target|command|changes}`，一串步骤是列表），后台据此判断；没有 facts 时扫描问题和细节文字。
 
+## 5b. 撤回（rewind）
+
+- `client.say(line, text)` 的应答多一个 `"turn"`：这句话在那条线上的编号（排队的几句一起发出时共用一个）。窗口把它记在对话记录里那几行上，右键「从这里重来」时用。
+- `client.rewind(line="", turn=None, steps=1)` → `{"ok", "message", "text", "files_restored"}`。`line` 为空 = 当前线。给了 `turn`：这一句和之后的都撤掉；没给：撤掉最后 `steps` 句。`text` 是被撤掉的第一句的原文（窗口把它放回输入框）；`message` 是要念的一句话（"撤回到「…」之前。N 个文件已改回去。"）。那条线正在回答时拒绝："正在回答，先打断再撤回。"
+- 撤掉的几轮改过文件时，后台先发一个 `ask`（kind approve）："这几轮改过 N 个文件，要一起改回去吗？"。Claude Code 线路用它自己的文件检查点改回；Codex 线路只能撤回对话，`message` 会说文件没动。
+- 做法：Claude Code 线路以 `--resume <对话> --resume-session-at=<保留的最后一条>` 重新接上（只撤一轮时再加 `--resume-drops-turn` 做核对），新对话编号照常记进 lines.json；Codex 线路用 `thread/fork` 的 `lastTurnId`。重新接上之前不算成功；接不上就报失败，那条线留在原来的对话上。
+- 事件 `{"event": "rewound", "line", "turn", "text"}`：任何一次撤回之后都发（口头说的也是），窗口在对话记录里加一行"—— 撤回到「…」之前 ——"。
+- 固定短语 `rewind_last`（"撤回上一句""退回上一句""回到上一句"等；单说"撤回"不算，那是给模型的话）= `rewind(当前线, steps=1)`，`spoken` 就是那句总结。窗口自己走 `client.rewind(steps=1)`（等得更久，并把那句放回输入框）。
+
 ## 6. 三级打断在接口上的样子
 
 - ①（开口）：全在前台：压低、停朗读、排队；**不发任何命令**。这一轮的 `done` 到了再把排队的话 `say` 出去。

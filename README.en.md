@@ -63,12 +63,18 @@ The main key is right Ctrl. The second key is right Alt.
 
 In continuous conversation with headphones on, just start talking to make it stop speaking. Its work carries on and your words are queued. Pauses shorter than 2 seconds won't cut you off. Code blocks are shown in the window, not read out.
 
+When you can't talk, type in the box at the bottom of the window and press Enter (Shift+Enter for a new line). It works the same as speaking.
+
+To take something back, say "撤回上一句" (undo the last sentence; say it again to go further back), or right-click one of your sentences in the window and choose **从这里重来** (start over from here). The conversation goes back to just before it, and the sentence lands in the box for you to edit and send again. If the turns you undo changed files, it asks whether to change them back too.
+
 A few things to say:
 
 - "去 Atlas" or "接我到 Atlas 项目" (take me to the Atlas project). The manager first asks "要接到 Atlas 吗？" (connect you to Atlas?)
-- "回到总机" (back to the manager), "后台怎么样了" (how are the background jobs doing)
+- "回到总机" (back to the manager), "后台怎么样了" (how are the background jobs doing), "撤回上一句" (undo the last sentence)
 - "切到 DeepSeek" (switch to DeepSeek), "把模型切换成 sonnet" (switch the model to sonnet). Both ask you first
 - "打开 AI 服务商" (open the AI service page), "打开通透模式" / "关闭通透模式" (transparent mode on / off), "结束对话" (end the conversation)
+
+Say a fixed phrase on its own (a lead-in such as 好, 能不能 or 帮我 is fine); inside a longer sentence it goes to the model as ordinary words.
 
 You can change settings by voice too, for example "把字号放大两个号" (font size up two steps) or "麦克风换成 USB 那个" (use the USB microphone). All settings live in `~/.voice-claude/config.toml`, created from `config.example.toml`, with every option commented.
 

@@ -18,7 +18,7 @@ from .claude import DESKTOP_SERVER, MANAGER_SERVER, SETTINGS_SERVER, ClaudeSessi
 from .engine_codex import CodexSession
 from .config import PERMISSION_LABELS, PERMISSION_VALUES, Config, normalize_permission_value, save as config_save
 from .jobs import Job, Jobs, looks_endless
-from .line import CLOSED, DEAD, IDLE, STARTING, WAITING, WORKING, Line
+from .line import CLOSED, DEAD, IDLE, STARTING, WAITING, WORKING, Line, file_hash
 from .projects import Project
 
 log = logging.getLogger(__name__)
@@ -50,7 +50,8 @@ def normalize_model(text: str) -> str | None:
     return MODEL_ALIASES.get(t)
 FRONTEND_PATHS = {"get_settings", "list_devices", "set_font_size", "set_microphone", "set_speaker",
                   "list_voices", "set_voice", "set_speed"}
-PHRASES = {"back_to_manager", "scratch", "background_mode", "background_status", "shutdown_daemon", "transparent_on", "transparent_off"}
+PHRASES = {"back_to_manager", "scratch", "background_mode", "background_status", "shutdown_daemon", "transparent_on", "transparent_off",
+           "rewind_last"}
 TRANSPARENT_QUESTION = "开启通透模式：除删除和覆盖已有文件外，所有操作直接执行，不再询问。设为禁止的仍然禁止。可以吗？"
 TRANSPARENT_PASSED = "通透模式：直接执行。"  # what the model hears: nobody was asked, so never "用户同意了"
 
@@ -94,6 +95,11 @@ class Switchboard:
         self.pending: dict[str, dict] = {}  # ask requests waiting for the user's answer
         self.ask_lock = threading.Lock()  # one spoken question at a time
         self.brake_gen = 0  # counts emergency stops: a request queued before one is never asked after it
+        self.rewound_backup: dict[str, tuple[list[dict], int]] = {}  # line -> (turns its latest rewind dropped, files restored)
+        self.transcript_tail = projects.transcript_tail  # tests replace it
+        self.frontend_pid = 0  # the window's process: the desktop tools never type into it
+        self.forgotten: set[str] = set()  # projects whose saved conversation was dropped in this run
+        self.lines_lock = threading.Lock()  # every read-modify-write of lines.json, from any thread
         self.max_lines = int(getattr(cfg, "max_lines", 3))
         self.idle_seconds = float(getattr(cfg, "idle_minutes", 10)) * 60
         # VOICECLAUDE_START_WITH lets a self-test pick its own project without touching config.toml
@@ -454,13 +460,16 @@ class Switchboard:
         self._ensure_gateway(line.provider)  # raises when the translation layer cannot serve this provider
         s = ClaudeSession(self.cfg, prompt, line.on_session, cwd=line.cwd, line_id=line.id, resume=resume,
                           model=model, effort=effort, servers=servers, provider=line.provider)
+        if resume and getattr(line, "resume_fork", None):
+            s.fork_at = tuple(line.resume_fork)  # the rewind made before the line was closed, still to be made real
         s.port = self.control_port
         return s
 
     def _engine_for(self, pid: str) -> str:
         return "codex" if self._own_route(self.provider_status(pid)) else "claude"
 
-    def open_line(self, line_id: str, name: str, cwd: str, kind: str, resume: str = "", resume_engine: str = "") -> Line:
+    def open_line(self, line_id: str, name: str, cwd: str, kind: str, resume: str = "", resume_engine: str = "",
+                  resume_fork: list | None = None) -> Line:
         if resume and resume_engine and resume_engine != self._engine_for(self.provider):
             # a Codex thread cannot be continued by Claude Code, nor the other way round: a new conversation
             log.info("[%s] saved conversation %s is %s's; this line runs on the other engine: starting fresh",
@@ -475,10 +484,16 @@ class Switchboard:
                 factory = lambda ln, resume: managers.RulesSession(ln, self)  # noqa: E731
             line = Line(line_id, name, cwd, kind, factory, lambda i, k, d: self.on_line_event(i, k, d), now=self.now)
             line.provider = self.provider  # new lines answer through the default provider
+            line.resume_fork = list(resume_fork) if resume and resume_fork else None
             self.lines[line_id] = line
         self.line_started[line_id] = time.time()
         try:
             line.start(resume)
+            if resume and line.engine == "claude":
+                # the point a rewind of this process's first sentence goes back to: the saved conversation's end (or
+                # the pending rewind's point, when the line was closed before that rewind was made)
+                at = line.resume_fork[0] if line.resume_fork else self.transcript_tail(resume)
+                line.base_point = {"last": at} if at else None
         except Exception as e:
             log.exception("[%s] could not start", line_id)
             line.state = DEAD
@@ -493,8 +508,19 @@ class Switchboard:
             if existing and existing.state not in (DEAD, CLOSED):
                 return existing
             self._make_room()
-        return self.open_line(line_id, p.display_name, p.cwd, "project", resume=p.session_id,
-                              resume_engine=getattr(p, "session_engine", ""))
+        rec = self._read_line_record(p.key)
+        if isinstance(rec, dict) and rec.get("session_id"):  # what this run saved last, not the start-up index
+            p.session_id = str(rec["session_id"])
+            p.session_engine = str(rec.get("engine") or projects.engine_of_session(p.session_id))
+            fork = rec.get("fork_at")
+            p.session_fork = list(fork) if isinstance(fork, list) and len(fork) == 2 and fork[0] else None
+        elif isinstance(rec, dict) or rec is None and p.session_id and self._forgotten(p.key):
+            p.session_id, p.session_engine, p.session_fork = "", "", None
+        line = self.open_line(line_id, p.display_name, p.cwd, "project", resume=p.session_id,
+                              resume_engine=getattr(p, "session_engine", ""), resume_fork=getattr(p, "session_fork", None))
+        if isinstance(rec, dict) and rec.get("note") and rec.get("session_id") == p.session_id:
+            line.pending_note = str(rec["note"])  # the model still has to hear about files put back
+        return line
 
     def _make_room(self) -> None:
         """Close the least recently used closable project line when the limit is reached (lock held)."""
@@ -588,15 +614,173 @@ class Switchboard:
             if not self.access.ok:
                 return {"ok": False, "message": "还没接入：" + self.access.message}
             return {"ok": False, "message": "那条线不在了"}
+        if getattr(line, "rewinding", False):
+            return {"ok": False, "message": "正在撤回，稍等。"}
         if line.kind == MANAGER:
             self._manager_log("你", text)
+        turn = "t" + uuid.uuid4().hex[:10]  # this user message on this line, for rewinding to it
         try:
-            line.say(text)
+            line.say(text, turn)
         except RuntimeError as e:
             return {"ok": False, "message": str(e)}
         self.turn_started[line_id] = time.time()
         self._emit_line(line)
-        return {"ok": True, "message": ""}
+        return {"ok": True, "message": "", "turn": turn}
+
+    # ---------- rewind: back to just before one of the user's sentences ----------
+
+    def rewind(self, line_id: str = "", turn: str | None = None, steps: int = 1) -> dict:
+        """Drop the user turn `turn` and everything after it (or, without `turn`, the last `steps` user turns). The
+        conversation continues from just before it; files are put back after one spoken question (Claude Code lines
+        only: Codex cannot). One rewind per line at a time. Returns the first dropped sentence for the text box."""
+        line = self.lines.get(line_id or self.active_id or "")
+        if line is None or line.session is None or line.state in (DEAD, CLOSED):
+            return self._rewind_no("那条线不在了")
+        with self.lock:
+            if line.rewinding:
+                return self._rewind_no("正在撤回，稍等。")
+            line.rewinding = True
+        try:
+            return self._rewind(line, turn, steps)
+        finally:
+            line.rewinding = False
+
+    @staticmethod
+    def _rewind_no(message: str, restored: int = 0) -> dict:
+        return {"ok": False, "message": message, "text": "", "files_restored": restored}
+
+    @staticmethod
+    def _busy(line: Line) -> bool:
+        return line.state == WORKING or bool(getattr(line.session, "turn_active", False))
+
+    def _rewind(self, line: Line, turn: str | None, steps: int) -> dict:
+        if self._busy(line):
+            return self._rewind_no("正在回答，先打断再撤回。")
+        log_ = line.turn_log
+        if turn:
+            k = next((i for i, e in enumerate(log_) if e["turn"] == turn), None)
+            if k is None:
+                return self._rewind_no("找不到那一句（可能是这条线重新开始以前说的），没有撤回。")
+        else:
+            k = max(0, len(log_) - max(1, int(steps or 1))) if log_ else None
+        if k is None:
+            return self._rewind_no("没有可以撤回的话。")
+        dropped = list(log_[k:])
+        first = dropped[0]
+        codex = line.engine == "codex"
+        # ---- where the conversation goes back to, checked before anything is asked or changed ----
+        if k > 0:
+            keep = log_[k - 1]
+        elif line.log_from_start:
+            keep = None  # the first sentence of the conversation: a new conversation
+        elif line.base_point and line.base_point.get("codex_turn" if codex else "last"):
+            keep = line.base_point  # a resumed conversation: back to where it stood when this process took it up
+        else:
+            return self._rewind_no("这条线是接着以前的对话开的，撤回不到这次接上后的第一句之前。")
+        if keep is not None and not (keep.get("codex_turn") if codex else keep.get("last") and first.get("prompt")):
+            return self._rewind_no("找不到撤回的位置（这几轮的记录不全），没有撤回。")
+        # ---- files ----
+        restored, note, said = 0, "", ""
+        ours = {self._norm_path(line, f) for e in dropped for f in e["files"]}
+        created = {self._norm_path(line, f) for e in dropped for f in e.get("created", ())}
+        written = {}  # how each file looked after the last dropped turn that wrote it
+        for e in dropped:
+            for f, h in (e.get("hashes") or {}).items():
+                written[self._norm_path(line, f)] = h
+        if codex or not hasattr(line.session, "rewind_files"):
+            if ours:
+                note = f"改过的 {len(ours)} 个文件没有改回去（这条线只能撤回对话）。"
+        elif first.get("prompt"):
+            dry = line.session.rewind_files(first["prompt"], dry_run=True)
+            shown = {self._norm_path(line, f): os.path.join(line.cwd, f) for e in dropped for f in e["files"]}
+            shown.update({self._norm_path(line, f): f for f in dry["files"] or []})  # as Claude Code spells them
+            changed = sorted({self._norm_path(line, f) for f in dry["files"]}) if dry["files"] is not None else sorted(ours)
+            if changed and not dry["ok"]:
+                note = f"文件没法改回去：{dry['error']}。"
+            elif changed:
+                outside = [f for f in changed if f not in ours]
+                deleted = [f for f in changed if f in created]
+                edited = [f for f in changed if written.get(f) and file_hash(f) not in (None, written[f])]
+                show = lambda fs: [shown.get(f, f) for f in fs]  # noqa: E731
+                answer = self.ask_frontend(line.id, "rewind_files",
+                                           self._files_question(show(changed), show(outside), show(deleted), show(edited)),
+                                           "\n".join(shown.get(f, f) + ("（会被删掉）" if f in deleted else "")
+                                                     + ("（之后又被改过）" if f in edited else "")
+                                                     + ("（不只是这几轮改的）" if f in outside else "") for f in changed))
+                if self._busy(line):  # it started answering while the question was up
+                    return self._rewind_no("正在回答，先打断再撤回。")
+                if answer is True:
+                    res = line.session.rewind_files(first["prompt"])
+                    if res["ok"]:
+                        done = {self._norm_path(line, f) for f in (res["files"] if res["files"] is not None else changed)}
+                        # what still differs afterwards was not put back (a link skipped, a missing backup, a locked file)
+                        check = line.session.rewind_files(first["prompt"], dry_run=True)
+                        still = {self._norm_path(line, f) for f in check["files"] or []} if check["ok"] else set()
+                        back = sorted(done - still)
+                        restored = len(back)
+                        said = self._names(show(back)) or "文件"
+                        missed = len(done & still) or res["skipped"]
+                        note = (f"{said}已改回去。" if back else "文件没有改回去。") \
+                            + (f"{missed} 个没能改回去" + ("（其中有为安全跳过的链接文件）" if res["skipped"] else "") + "。" if missed else "") \
+                            + "用命令改的文件不在内。"
+                    else:
+                        note = f"文件没能改回去：{res['error']}。"
+                else:
+                    note = "文件保持现在的样子。"
+        elif ours:
+            note = "文件没法改回去（这一句的记录不全）。"
+        # ---- the conversation ----
+        try:
+            if keep is None:
+                line.session.restart(fresh=True)  # nothing before it to keep: a new conversation
+                self._forget_session(line)
+                line.session_id, line.started_resume, line.base_point, line.log_from_start = "", "", None, True
+            else:
+                line.session.rewind_to(keep, first, single=len(dropped) == 1)
+            line.pending_note = ""  # whatever a half-done rewind left for the model is about turns now gone
+        except Exception as e:
+            # the line is back on its conversation as it was; the turn record stays as it is
+            log.warning("[%s] rewind failed: %s", line.id, e)
+            if restored:
+                line.pending_note = f"（说明：{said}已改回到「{self._short(first['text'])}」之前的样子，但对话没有撤回。）"
+                return self._rewind_no(f"文件已改回去，但对话没撤回：{e}。", restored)
+            return self._rewind_no(f"撤回没成功：{e}。对话保持原样。")
+        self.rewound_backup[line.id] = (dropped, restored)  # put back if the engine refuses the truncated conversation
+        line.turn_log[:] = [e for e in line.turn_log if not any(e is d for d in dropped)]  # only these: not words said since
+        if not self._busy(line):
+            line.state, line.reply = IDLE, ""
+        self._save_lines()  # the pending fork point on disk at once, not at the next tick
+        self.emit("rewound", {"line": line.id, "turn": first["turn"], "text": first["text"]})
+        self._emit_line(line)
+        log.info("[%s] rewound %d turn(s) to before %s; %s", line.id, len(dropped), first["turn"], note or "no files")
+        return {"ok": True, "message": f"撤回到「{self._short(first['text'])}」之前。" + note, "text": first["text"],
+                "files_restored": restored}
+
+    @staticmethod
+    def _short(text: str) -> str:
+        return text if len(text) <= 12 else text[:12] + "……"
+
+    @staticmethod
+    def _norm_path(line: Line, f: str) -> str:
+        return os.path.normcase(os.path.abspath(os.path.join(line.cwd, f)))
+
+    @staticmethod
+    def _names(files: list[str]) -> str:
+        """One or two files by name, more as a count."""
+        return "、".join(Path(f).name for f in files) if 0 < len(files) <= 2 else (f"{len(files)} 个文件" if files else "")
+
+    def _files_question(self, changed: list[str], outside: list[str], deleted: list[str] = (), edited: list[str] = ()) -> str:
+        """Short enough for the card: what changes, and what the restore also does that the user may not expect."""
+        also = []
+        if deleted:
+            also.append(f"{self._names(list(deleted))}是这几轮新建的，会被删掉")
+        if edited:
+            also.append(f"{self._names(list(edited))}之后又被改过，那些改动也会没了")
+        if outside:
+            also.append(f"其中 {len(outside)} 个不只是这几轮改的，会被改回那时的样子，那时还没有的会被删掉")
+        if also:
+            return f"要把 {self._names(changed)}改回去吗？" + "；".join(also) + "。"
+        return f"这几轮改过 {self._names(changed)}，要一起改回去吗？"
 
     def interrupt(self, line_id: str) -> dict:
         line = self.lines.get(line_id)
@@ -639,7 +823,7 @@ class Switchboard:
             return []
         what = "、".join((j.note or j.command[:30]) for j in running[:3])
         q = f"还有 {len(running)} 个后台任务在跑（{what}），要一起停吗？"
-        answer = self.ask_frontend(self.active_id or MANAGER, "stop_jobs", q)
+        answer = self.ask_frontend(self.active_id or MANAGER, "stop_jobs", q, service=True)
         if answer is True or (answer is False and kill_on_timeout and self._last_ask_timed_out):
             stopped = self.jobs.cancel_all()
             if stopped:
@@ -647,11 +831,12 @@ class Switchboard:
             return stopped
         return []
 
-    def request_shutdown(self, jobs: str = "ask") -> dict:
+    def request_shutdown(self, jobs: str = "ask", lines_confirmed: bool = False) -> dict:
         """'关掉后台服务' or the window's quit button: close every line and exit. jobs: "ask" = running jobs are
         asked about out loud first (no answer = stop them, nobody will be around to look after an endless
         command); "stop" = stop them all, then exit (the window already asked); "keep" = leave them running and
-        exit (they are detached processes; see docs on when that holds)."""
+        exit (they are detached processes; see docs on when that holds). lines_confirmed: the window already asked
+        about lines that are mid-turn, so that question is not asked again (the one about jobs still is)."""
         if jobs not in ("ask", "stop", "keep"):
             return {"ok": False, "spoken": f"jobs 只能是 ask、stop 或 keep，不是 {jobs}", "shutdown": False}
         running = self.jobs.running()
@@ -659,9 +844,18 @@ class Switchboard:
             stopped = self.jobs.cancel_all()
             self.emit("notice", {"text": f"已停掉 {len(stopped)} 个后台任务。"})
             return {"ok": True, "spoken": f"好，停掉 {len(stopped)} 个后台任务，关掉后台服务。", "shutdown": True}
-        if jobs == "ask" and running:
+        working = [] if lines_confirmed else [l for l in self.lines.values() if l.state == WORKING
+                                              or (l.state == WAITING and getattr(l.session, "turn_active", False))]
+        if jobs == "ask" and (running or working):
             def go():
-                self._ask_stop_jobs(True)
+                if working:
+                    who = "、".join(l.name for l in working[:2]) + (f"等 {len(working)} 条线" if len(working) > 2 else "")
+                    if self.ask_frontend(self.active_id or MANAGER, "shutdown", f"{who}还在做事，要关掉后台服务吗？",
+                                         service=True) is not True:
+                        self.emit("notice", {"text": "没有关掉后台服务。"})  # no answer: nothing is cut off mid-turn
+                        return
+                if self.jobs.running():
+                    self._ask_stop_jobs(True)
                 if self.shutdown_hook:
                     self.shutdown_hook()
             threading.Thread(target=go, daemon=True, name="shutdown").start()
@@ -671,6 +865,9 @@ class Switchboard:
         return {"ok": True, "spoken": "好，关掉后台服务。", "shutdown": True}
 
     def phrase(self, key: str) -> dict:
+        if key == "rewind_last":
+            r = self.rewind(self.active_id or MANAGER, steps=1)
+            return {"ok": r["ok"], "spoken": r["message"], "text": r.get("text", ""), "files_restored": r.get("files_restored", 0)}
         if key == "back_to_manager":
             self.switch(MANAGER, announce="好，回到总机。")
             return {"ok": True, "spoken": ""}
@@ -702,7 +899,7 @@ class Switchboard:
 
     def _ask_transparent(self) -> bool:
         """Turning it on is always confirmed out loud, with the exact wording, whatever the table says."""
-        if self.ask_frontend(self.active_id or MANAGER, "transparent", TRANSPARENT_QUESTION) is True:
+        if self.ask_frontend(self.active_id or MANAGER, "transparent", TRANSPARENT_QUESTION, service=True) is True:
             self._set_transparent(True)
             self.emit("notice", {"text": "通透模式已开启：删除和覆盖已有文件仍会问，其他直接做。"})
             return True
@@ -788,10 +985,13 @@ class Switchboard:
         ok = self.ask_frontend(line_id, "batch", question, detail) is True
         return {"ok": ok, "message": "用户同意了。" if ok else "用户没有同意，没有执行。不要再试同一串动作，口头说一句就好。"}
 
-    def ask_frontend(self, line_id: str, action: str, question: str, detail: str = "", kind: str = "approve") -> bool | str:
+    def ask_frontend(self, line_id: str, action: str, question: str, detail: str = "", kind: str = "approve",
+                     service: bool = False) -> bool | str:
         """Have the front end ask the user out loud. One question at a time. True/False for approvals; the user's
-        words for kind='question'; False/'' after the timeout (also when no front end is connected)."""
-        line = self.lines.get(line_id)
+        words for kind='question'; False/'' after the timeout (also when no front end is connected). service: a
+        question of the service's own (shutdown, 通透模式, stopping jobs), shown on `line_id`'s card but leaving that
+        line's state and mailbox alone."""
+        line = None if service else self.lines.get(line_id)
         gen = self.brake_gen
         with self.ask_lock:
             if self.stopping or self.brake_gen != gen:  # the brake was pulled while this request waited its turn
@@ -800,16 +1000,18 @@ class Switchboard:
             slot = {"event": threading.Event(), "answer": None, "text": "", "line": line_id}
             with self.lock:
                 self.pending[request] = slot
-                if line:
-                    line.state = WAITING if line.state == WORKING else line.state
-            self.emit("ask", {"request": request, "line": line_id, "line_name": line.name if line else "",
+                was_working = bool(line) and line.state == WORKING
+                if was_working:
+                    line.state = WAITING
+            shown = self.lines.get(line_id)
+            self.emit("ask", {"request": request, "line": line_id, "line_name": shown.name if shown else "",
                               "action": action, "question": question, "detail": detail, "kind": kind,
                               "background": line_id != self.active_id})
             slot["event"].wait(self.ask_timeout)
             with self.lock:
                 self.pending.pop(request, None)
-                if line and line.state == WAITING:
-                    line.state = WORKING
+                if was_working and line.state == WAITING and getattr(line.session, "turn_active", True):
+                    line.state = WORKING  # only what this question changed, and only while its turn still runs
             answer, text = slot["answer"], slot["text"]
             self._last_ask_timed_out = answer is None
         if line:
@@ -859,6 +1061,8 @@ class Switchboard:
             return {"ok": ok, "message": why or "用户同意了。", "brake": gen}
         if path == "brake":
             return {"ok": True, "message": "", "brake": self.brake_gen}
+        if path == "frontend_pid":
+            return {"ok": True, "message": "", "pid": self.frontend_pid}
         if path == "set_transparent":
             return self._set_transparent_from_line(bool(data.get("on")))
         if path == "switch_model":
@@ -1089,6 +1293,15 @@ class Switchboard:
             self._apply_pending(line)
             self._emit_line(line)
             return
+        if kind == "rewind_failed":
+            back, restored = self.rewound_backup.pop(line_id, ([], 0))
+            line.turn_log.extend(back)
+            if restored and back:
+                line.pending_note = f"（说明：{restored} 个文件已改回到「{self._short(back[0]['text'])}」之前的样子，但对话没有撤回。）"
+                self.emit("notice", {"text": f"{line.name}撤回没成功：文件已改回去，但对话没撤回。"})
+            else:
+                self.emit("notice", {"text": f"{line.name}撤回没成功（那几轮里有没看到的内容），对话保持原样。"})
+            return
         if kind == "dead":
             if self.stopping:
                 return
@@ -1151,6 +1364,9 @@ class Switchboard:
         try:
             line.session.restart(fresh=True)
             line.state = IDLE
+            line.turn_log.clear()
+            line.log_from_start, line.base_point = True, None
+            line.pending_note = ""
         except Exception:
             log.exception("[%s] fresh restart failed", line.id)
             return False
@@ -1163,23 +1379,29 @@ class Switchboard:
         conversation found"): the id is no good here. Forget it, start a new conversation, and hand the waiting words
         to it."""
         s = line.session
-        if s is None or not line.started_resume or line.ready_seen:
-            return False
+        if s is None or not line.started_resume or line.ready_seen or line.engine == "codex":
+            return False  # Codex falls back from a failed thread/resume itself: an exit is not that, keep the thread
         if not getattr(s, "resume_failed", False) and line.now() - line.started_at > 10:
             return False  # it ran for a while: some other failure, keep the conversation for the next try
         log.info("[%s] could not continue conversation %s%s; starting a new one", line.id, line.started_resume[:8],
                  " (no such conversation)" if getattr(s, "resume_failed", False) else "")
         self._forget_session(line)
         line.started_resume, line.session_id = "", ""
+        waiting = line.turn_log[-1]["turn"] if busy and line.turn_log else None
+        in_flight = busy and line.sending  # a Codex send still waiting for its thread: it goes to the fresh one itself
+        kept = [line.turn_log[-1]] if in_flight and line.turn_log else []
         try:
             s.restart(fresh=True)
-            line.state = IDLE
+            line.state = WORKING if in_flight else IDLE
+            line.turn_log[:] = kept
+            line.log_from_start, line.base_point = True, None
+            line.pending_note = ""
         except Exception:
             log.exception("[%s] fresh start failed", line.id)
             return False
         self.emit("notice", {"text": f"{line.name}接不上上次的对话，对话重新开始。"})
-        if busy and line.last_said:
-            line.say(line.last_said)  # the words the old process never answered
+        if busy and line.last_said and not in_flight:
+            line.say(line.last_said, waiting)  # the words the old process never answered, under the same id
             self.turn_started[line.id] = time.time()
         self._emit_line(line)
         return True
@@ -1196,16 +1418,18 @@ class Switchboard:
         self.emit("notice", {"text": f"{line.name}已重新连接"})
         return ""
 
+    def _forgotten(self, key: str) -> bool:
+        return key in self.forgotten
+
     def _forget_session(self, line: Line) -> None:
         """Drop a project's saved conversation id that turned out not to resume."""
         if line.kind != "project":
             return
-        data = projects.load_lines(paths.LINES_FILE)
-        if data.pop(projects.norm_key(line.cwd), None) is not None:
-            try:
-                paths.LINES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
-            except OSError:
-                log.exception("could not save lines.json")
+        with self.lines_lock:
+            self.forgotten.add(projects.norm_key(line.cwd))
+            data = projects.load_lines(paths.LINES_FILE)
+            if data.pop(projects.norm_key(line.cwd), None) is not None:
+                self._write_lines(data)
         for p in self.index:
             if p.key == projects.norm_key(line.cwd):
                 p.session_id, p.session_engine = "", ""
@@ -1241,17 +1465,46 @@ class Switchboard:
             self._apply_pending(l)
         self._save_lines()
 
+    def _write_lines(self, data: dict) -> None:
+        """lines.json written whole or not at all (a temp file in the same folder, then replaced): a reader never sees
+        half a file, and two writers never leave one's tail after the other's end."""
+        try:
+            paths.LINES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = paths.LINES_FILE.with_name(f"{paths.LINES_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, paths.LINES_FILE)
+                    return
+                except PermissionError:  # another program has it open for a moment (an editor, a virus scanner)
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        except OSError:
+            log.exception("could not save lines.json")
+
+    def _read_line_record(self, key: str):
+        with self.lines_lock:
+            return projects.load_lines(paths.LINES_FILE).get(key)
+
     def _save_lines(self) -> None:
+        with self.lines_lock:
+            self._save_lines_locked()
+
+    def _save_lines_locked(self) -> None:
         data = projects.load_lines(paths.LINES_FILE)
         for l in self.lines.values():
             if l.kind == "project" and l.session_id:
-                data[projects.norm_key(l.cwd)] = {"session_id": l.session_id, "engine": l.engine, "provider": l.provider,
-                                                  "name": l.name, "last_used": time.time()}
-        try:
-            paths.LINES_FILE.parent.mkdir(parents=True, exist_ok=True)
-            paths.LINES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
-        except OSError:
-            log.exception("could not save lines.json")
+                rec = {"session_id": l.session_id, "engine": l.engine, "provider": l.provider, "name": l.name,
+                       "last_used": time.time()}
+                fork = getattr(l.session, "fork_at", None)
+                if fork and getattr(l.session, "session_id", "") == l.session_id:
+                    rec["fork_at"] = list(fork)  # a rewind not made yet: reopening must not bring the dropped turns back
+                if l.pending_note:
+                    rec["note"] = l.pending_note
+                data[projects.norm_key(l.cwd)] = rec
+                self.forgotten.discard(projects.norm_key(l.cwd))
+        self._write_lines(data)
 
     def _manager_log(self, who: str, text: str) -> None:
         try:

@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from voiceclaude import line as linemod
@@ -30,6 +31,98 @@ class FakeSession:
 
     def restart(self, model=None):
         self.calls.append("restart")
+
+
+class SayRollbackTests(unittest.TestCase):
+    def test_an_exit_during_turn_start_leaves_the_line_dead(self):
+        """The app-server exits while starting the turn: the line is DEAD (so the next words reconnect it); the turn's
+        late error must not make it IDLE with no process behind it."""
+        import sys
+        from pathlib import Path as P
+        sys.path.insert(0, str(P(__file__).parent))
+        from test_engine_codex import FakeAppServer, wait_for
+        from voiceclaude import config
+        from voiceclaude.engine_codex import CodexSession
+        script = {}
+        events = []
+
+        def factory(ln, resume):
+            return CodexSession(config.Config(), "x", ln.on_session, line_id=ln.id, exe=r"C:\codex\codex.exe",
+                                transport_factory=lambda a, c, e: FakeAppServer(a, c, e, script))
+        line = Line("l9", "Atlas", ".", "project", factory, lambda i, k, d: events.append((k, d)))
+        line.start()
+        self.assertTrue(wait_for(lambda: line.session.ready.is_set()))
+        script["turn_dies"] = True
+        line.say("把 build 目录删掉", "t1")
+        self.assertTrue(wait_for(lambda: line.state == DEAD))
+        time.sleep(0.3)
+        self.assertEqual(line.state, DEAD)
+        self.assertEqual([k for k, d in events].count("dead"), 1)
+        line.on_session("done", {"status": "error", "message": "late"})  # however late it comes
+        self.assertEqual(line.state, DEAD)
+        line.session.close()
+
+    def test_a_refused_send_never_undoes_a_later_say(self):
+        """The first sentence's send fails only after the line said something else meanwhile (a reconnect resent it):
+        the rollback leaves that later say's state and words alone."""
+        line = Line("l1", "Atlas", "E:/Atlas", "project", FakeSession, lambda i, k, d: None)
+        line.start()
+        real_send = line.session.send
+
+        def later_say_then_fail(text):
+            line.session.send = real_send
+            line.say("又说了一句", "t2")
+            raise RuntimeError("Codex 重新启动过，这句没有发出去，请再说一遍")
+        line.session.send = later_say_then_fail
+        with self.assertRaises(RuntimeError):
+            line.say("第一句", "t1")
+        self.assertEqual((line.state, line.last_said, [e["turn"] for e in line.turn_log]), (WORKING, "又说了一句", ["t2"]))
+
+    def test_a_refused_send_keeps_a_death_that_happened_meanwhile(self):
+        """The Codex app-server died while the sentence waited for it: the line is DEAD (so the next words reconnect it),
+        and the rollback must not put it back to IDLE."""
+        events = []
+        line = Line("l1", "Atlas", "E:/Atlas", "project", FakeSession, lambda i, k, d: events.append((k, d)))
+        line.start()
+        line.say("一", "t1")
+        line.on_session("done", {"status": "ok", "message": "好。"})
+
+        def dies_then_refuses(text):
+            line.on_session("exit", 1)
+            raise RuntimeError("Codex 已关闭")
+        line.session.send = dies_then_refuses
+        with self.assertRaises(RuntimeError):
+            line.say("二", "t2")
+        self.assertEqual(line.state, DEAD)
+        self.assertEqual(([e["turn"] for e in line.turn_log], line.last_said), (["t1"], "一"))
+
+
+class TurnLogTests(unittest.TestCase):
+    def test_each_user_turn_keeps_the_engine_ids_and_the_files_it_changed(self):
+        events = []
+        line = Line("l1", "Atlas", "E:/Atlas", "project", FakeSession, lambda i, k, d: events.append((k, d)))
+        line.start()
+        line.say("改一下", "t1")
+        line.on_session("mark", {"prompt": "p1", "last": "p1"})
+        line.on_session("tool", {"name": "Write", "input": {"file_path": "a.txt"}})
+        line.on_session("mark", {"last": "a1"})
+        line.on_session("tool", {"name": "Edit", "input": {"file_path": "x、y", "files": ["x", "y"]}})  # Codex's file change
+        line.on_session("tool", {"name": "Bash", "input": {"command": "ls"}})
+        line.on_session("mark", {"prompt": "late", "codex_turn": "turn-1"})  # a prompt id is never replaced
+        e = line.turn_log[-1]
+        self.assertEqual((e["turn"], e["text"], e["prompt"], e["last"], e["codex_turn"]), ("t1", "改一下", "p1", "a1", "turn-1"))
+        self.assertEqual(e["files"], {"a.txt", "x", "y"})
+        self.assertEqual(e["created"], {"a.txt", "x", "y"})  # none of them existed when the tool was called
+        line.say("二")
+        self.assertTrue(line.turn_log[-1]["turn"].startswith("t"))
+        line.start()  # a new process: the earlier turns are not known to it
+        self.assertEqual((line.turn_log, line.log_from_start), ([], True))
+        line.start("saved")  # a resumed conversation: the record does not reach its start
+        self.assertFalse(line.log_from_start)
+        line.start()
+        for i in range(201):
+            line.say(str(i))
+        self.assertEqual((len(line.turn_log), line.log_from_start), (200, False))  # trimmed: no longer from the start
 
 
 class LineTests(unittest.TestCase):

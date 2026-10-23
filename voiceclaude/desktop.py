@@ -289,6 +289,8 @@ def _u32():
         u.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(_GUITHREADINFO)]
         u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
         u.GetAncestor.restype = wintypes.HWND
+        u.WindowFromPoint.argtypes = [wintypes.POINT]
+        u.WindowFromPoint.restype = wintypes.HWND
         _USER32 = u
     return _USER32
 
@@ -328,6 +330,35 @@ def _process_image(hwnd: int) -> str:
             k.CloseHandle(h)
     except Exception:
         return ""
+
+
+def _window_at(x: int, y: int) -> int:
+    """The top-level window under a screen point."""
+    try:
+        h = int(_u32().WindowFromPoint(wintypes.POINT(x, y)) or 0)
+        return _root(h) or h
+    except Exception:
+        return 0
+
+
+def _frontend_pid() -> int:
+    """The voice-claude window's process (the service learns it when the window connects); 0 when unknown."""
+    try:
+        return int(_post({}, "frontend_pid").get("pid") or 0)
+    except Exception:
+        return 0
+
+
+def is_frontend(hwnd: int, pid: int | None = None) -> bool:
+    """Is it the voice-claude window? Keys typed there count as the user's own words (answers to request cards,
+    fixed phrases, new sentences), so the desktop tools never type, press keys or click into it."""
+    if not hwnd:
+        return False
+    pid = _frontend_pid() if pid is None else pid
+    return bool(pid) and _pid(hwnd) == pid
+
+
+FRONTEND_REFUSAL = "那是 voice-claude 自己的窗口：在那里输入、按键或点击等于替用户说话，没有执行。先让用户切到要操作的窗口。"
 
 
 def _related(fg: int, hwnd: int, same_process: bool = False) -> bool:
@@ -457,18 +488,24 @@ def ready_window(w: Window, follows: Run | None = None) -> str:
     approved-at-once run can have moved it there on purpose."""
     if follows is not None and follows.batch:
         _settle()
-    if w.pending and not w.hwnd:
+    placeholder = w.pending and not w.hwnd  # whatever the step before brings up (after Win+R, say)
+    if placeholder and follows is None:
         return f"{NOT_DONE}“{short_title(w.title)}”没有到前台。停下来问用户。"
     fg = _fg_hwnd()
-    ok = _related(fg, w.hwnd, same_process=follows is not None)
-    if not ok and follows is not None and follows.batch and fg and follows.windows and fg not in follows.windows:
+    ok = _related(fg, w.hwnd, same_process=follows is not None) if not placeholder else False
+    if not ok and follows is not None and (follows.batch or placeholder) and fg and follows.windows \
+            and fg not in follows.windows:
         ok = True  # a window the click / keys step before this one brought up (a window it merely activated is not)
+        if placeholder:
+            w.hwnd, w.title = fg, active_window() or w.title  # the steps after it go to the same window
     if not ok and w.hwnd and not (follows is not None and follows.batch) and _activate(w.hwnd):
         fg = _fg_hwnd()
         ok = _related(fg, w.hwnd, same_process=follows is not None)
     if not ok:
         now = short_title(active_window()) or "（无）"
         return f"{NOT_DONE}前台窗口变了（申请时是“{short_title(w.title) or '（无）'}”，现在是“{now}”）。停下来问用户。"
+    if is_frontend(fg):
+        return NOT_DONE + FRONTEND_REFUSAL
     if w.menu or follows is not None:
         return ""  # a menu that was open when asked, or that the step before opened: act inside it as announced
     for _ in range(2):
@@ -556,9 +593,18 @@ def _fail_safe_check() -> None:
     pyautogui.failSafeCheck()
 
 
-def _send_unicode(text: str) -> None:
-    for ch in text:
+class TypingStopped(Exception):
+    def __init__(self, typed: int):
+        super().__init__(typed)
+        self.typed = typed
+
+
+def _send_unicode(text: str, guard: Callable[[], bool] | None = None) -> None:
+    """Type text; before every character the corner fail-safe, and `guard` (False: stop, TypingStopped)."""
+    for n, ch in enumerate(text):
         _fail_safe_check()
+        if guard is not None and not guard():
+            raise TypingStopped(n)
         if ch == "\r":
             continue
         if ch in "\n\t":
@@ -622,11 +668,15 @@ def plan_click(x: int, y: int, target: str, button: str = "left", double: bool =
         return "button 只能是 left、right 或 middle，没有执行。"
     what = ("双击" if double else "右键点一下" if button == "right" else "点一下") + target.strip()
     announced = active_window()
+    if is_frontend(_window_at(*to_screen(x, y))):
+        return FRONTEND_REFUSAL  # its 可以 button answers a request: never clicked for the user
 
     def go():
         why = replace_prompt_popped(announced)
         if why:
             return why
+        if is_frontend(_window_at(*to_screen(x, y))):
+            return NOT_DONE + FRONTEND_REFUSAL
         if run is not None:
             run.windows = _all_windows()
         sx, sy = to_screen(x, y)
@@ -639,6 +689,8 @@ def plan_type(text: str, window: Window | None = None, run: Run | None = None, f
     if not text:
         return "没有要输入的文字。"
     w = window or current_window()
+    if not w.pending and is_frontend(w.hwnd):
+        return FRONTEND_REFUSAL
     facts = {"kind": "type", "text": text, "window": w.title}
     if w.hwnd and risk.SAVE_DIALOG.search(w.title or "") and not risk.in_replace_dialog(w.title):
         folder = dialog_folder(w.hwnd)  # so a bare name that exists there is asked about in 通透模式
@@ -649,9 +701,50 @@ def plan_type(text: str, window: Window | None = None, run: Run | None = None, f
         why = ready_window(w, run if follows else None) or replace_prompt_popped(w.title)
         if why:
             return why
-        _send_unicode(text)
+        target, pid = _fg_hwnd(), _frontend_pid()
+
+        def same_window() -> bool:  # checked before every character: the rest must not land anywhere else
+            now = _fg_hwnd()
+            return now == target and not (pid and _pid(now) == pid)
+        try:
+            _send_unicode(text, same_window)
+        except TypingStopped as s:
+            return (f"{NOT_DONE}输入到一半前台窗口变了（已输入 {s.typed} 个字，其余的没有输入）。"
+                    "停下来问用户。")
         return f"已输入 {len(text)} 个字。"
     return Plan("type", in_window(spoken_text(text), w.title), text, go, facts, window=w)
+
+
+WINDOW_KEYS = {"up", "down", "left", "right", "home"}  # Win+these maximise, minimise, snap or move the window in front
+
+
+def shell_shortcut(keys: list[str]) -> bool:
+    """A combination Windows handles itself (Win+…, Alt+Tab, Ctrl+Esc, Ctrl+Shift+Esc, Print Screen): it never reaches
+    the window in front, so the voice-claude window being there does not matter. Not Win+arrows / Win+Home (they act
+    on the window in front) and not Ctrl+Alt+Del (injected, it is no secure attention sequence: the window gets it)."""
+    k = set(keys)
+    if k in ({"win", "ctrl", "left"}, {"win", "ctrl", "right"}):
+        return True  # switch virtual desktop: the shell's, not the window's
+    if "win" in k:
+        return not (k & WINDOW_KEYS)
+    return "printscreen" in k or k in ({"alt", "tab"}, {"alt", "shift", "tab"}, {"ctrl", "esc"}, {"ctrl", "shift", "esc"})
+
+
+# Shortcuts that bring up a window of their own: what follows them in a run goes there.
+OPENERS = [{"win"}, {"ctrl", "esc"}, {"ctrl", "shift", "esc"}, {"win", "tab"}, {"win", "shift", "s"}, {"printscreen"}] \
+    + [{"win", c} for c in "reixsanvkpucwg123456789"]
+
+
+def _new_foreground(existing: set[int], timeout: float = 1.5) -> int:
+    """The window a shortcut brought up, once it is in front (0 if none came up in time)."""
+    t0 = time.monotonic()
+    while True:
+        h = _fg_hwnd()
+        if h and existing and h not in existing:
+            return h
+        if time.monotonic() - t0 >= timeout:
+            return 0
+        time.sleep(0.05)
 
 
 def plan_press(keys: str, window: Window | None = None, run: Run | None = None, follows: bool = False) -> Plan | str:
@@ -659,7 +752,26 @@ def plan_press(keys: str, window: Window | None = None, run: Run | None = None, 
         ks = parse_keys(keys)
     except ValueError as e:
         return f"{e}，没有执行。"
+    if shell_shortcut(ks):
+        opener = set(ks) in OPENERS
+        comes_up = Window(title="弹出的窗口", pending=True) if opener else None  # Win+R's Run box: what follows goes there
+
+        def go_shell():
+            existing = _all_windows()
+            if run is not None:
+                run.windows = existing
+            pyautogui.hotkey(*ks) if len(ks) > 1 else pyautogui.press(ks[0])
+            if comes_up is not None:
+                h = _new_foreground(existing)
+                if h and not is_frontend(h):
+                    comes_up.hwnd, comes_up.title = h, active_window() or comes_up.title  # so it can be brought back
+            return f"已按 {'+'.join(ks)}。"
+        # a shortcut that opens nothing leaves the steps after it on the window they were announced for
+        return Plan("hotkey", f"按{spoken_keys(ks)}", "", go_shell, {"kind": "hotkey", "keys": list(ks), "window": ""},
+                    opens=comes_up)
     w = window or current_window()
+    if not w.pending and is_frontend(w.hwnd):
+        return FRONTEND_REFUSAL
 
     def go():
         why = ready_window(w, run if follows else None) or replace_prompt_popped(w.title)

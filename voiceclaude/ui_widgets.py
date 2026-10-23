@@ -4,7 +4,9 @@ and the flat tk.Button styling. Pillow renders the round shapes at 4x and shrink
 anti-aliasing); straight bars are plain Canvas rectangles."""
 from __future__ import annotations
 
+import ctypes
 import math
+import os
 import time
 import tkinter as tk
 from typing import Callable
@@ -766,6 +768,143 @@ class Segmented(tk.Canvas):
         key = self.options[self.cursor_i][0]
         if key != self.value:
             self.on_change(key)
+
+
+# ---------- the text box ----------
+_IMM = []
+
+
+def _imm32():
+    """imm32 with 64-bit-safe signatures, or None (not Windows, or not loadable)."""
+    if not _IMM:
+        imm = None
+        if os.name == "nt":
+            try:
+                imm = ctypes.windll.imm32
+                imm.ImmGetContext.restype = ctypes.c_void_p
+                imm.ImmGetContext.argtypes = [ctypes.c_void_p]
+                imm.ImmGetCompositionStringW.restype = ctypes.c_long
+                imm.ImmGetCompositionStringW.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong]
+                imm.ImmReleaseContext.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            except Exception:
+                imm = None
+        _IMM.append(imm)
+    return _IMM[0]
+
+
+class TypeBox(tk.Frame):
+    """The text box under the transcript. Enter sends, Shift+Enter starts a new line; a grey hint while it is empty
+    and unfocused. on_submit(text) returns False when the text was not taken, and the box keeps it."""
+
+    HINT = "输入文字，回车发送"
+
+    def __init__(self, parent, theme: Theme, on_submit: Callable[[str], bool], bg: str):
+        px = theme.px
+        super().__init__(parent, bg=COLORS["stroke_card"])
+        inner = tk.Frame(self, bg=bg)
+        inner.pack(fill="both", expand=True, pady=(1, 0))  # the 1 px above is the rule between transcript and box
+        self.text = tk.Text(inner, height=2, wrap="char", bd=0, highlightthickness=0, padx=px(12), pady=px(8), undo=True,
+                            bg=bg, fg=COLORS["text_primary"], insertbackground=COLORS["text_primary"], font=theme.font("body"))
+        self.text.pack(fill="both", expand=True)
+        self.on_submit = on_submit
+        self.hinting = False
+        self.typed_at = 0.0  # time.monotonic() when you last changed the text (the hint and put() do not count)
+        self.emptied_at = 0.0  # when it last became empty
+        self.began_at = 0.0  # when you began writing into it after it was empty (an input method: when it began composing)
+        self._empty = True
+        self._composing_from = 0.0
+        self._placed: str | None = None  # what put() put there, until you change it
+        for seq in ("<Return>", "<KP_Enter>"):
+            self.text.bind(seq, self._enter)
+        self.text.bind("<<Modified>>", self._modified)  # typing, the input method, pasting: anything that edits
+        self.text.bind("<FocusIn>", lambda e: self._hint(False))
+        self.text.bind("<FocusOut>", lambda e: self._hint(True))
+        self._hint(True)
+
+    def value(self) -> str:
+        return "" if self.hinting else self.text.get("1.0", "end-1c")
+
+    def put(self, text: str) -> bool:
+        """Text the window chose (a rewound sentence); False, and the box left alone, when it holds something you
+        wrote. What an earlier put() left there, untouched, is replaced."""
+        now = self.value()
+        if now.strip() and now != self._placed:
+            return False
+        self._hint(False)
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", text)
+        self._placed = text
+        self.text.edit_reset()
+        return True
+
+    def _modified(self, _event=None):
+        """<<Modified>> comes after the change, from the event queue: tell your edits from the window's by content."""
+        if not self.text.edit_modified():
+            return
+        self.text.edit_modified(False)
+        if self.hinting:
+            return
+        now, content = time.monotonic(), self.text.get("1.0", "end-1c")
+        if not content.strip():
+            self.emptied_at, self._placed, self._empty, self._composing_from = now, None, True, 0.0
+        elif content != self._placed:
+            if self._empty:
+                self.began_at = self._composing_from or now
+            self.typed_at, self._placed, self._empty, self._composing_from = now, None, False, 0.0
+        else:
+            self._empty = False
+
+    def poll(self) -> None:
+        """While the box is empty, note when an input method begins composing into it: the text only arrives when
+        the composition is committed, but the writing began here."""
+        if not self._empty:
+            return
+        if self.composing():
+            if not self._composing_from:
+                self._composing_from = time.monotonic()
+        elif self._composing_from and not self.text.get("1.0", "end-1c").strip():
+            # given up (Esc, or the pinyin backspaced away): nothing reached the box, which counts as clearing it
+            self._composing_from, self.emptied_at = 0.0, time.monotonic()
+
+    def composing(self) -> bool:
+        """An input method (pinyin and the like) holds text it has not put into the box yet."""
+        imm = _imm32()
+        if imm is None:
+            return False
+        try:
+            hwnd = self.text.winfo_id()
+            himc = imm.ImmGetContext(hwnd)
+            if not himc:
+                return False
+            try:
+                return imm.ImmGetCompositionStringW(himc, 0x0008, None, 0) > 0  # GCS_COMPSTR: bytes being composed
+            finally:
+                imm.ImmReleaseContext(hwnd, himc)
+        except Exception:
+            return False
+
+    def _hint(self, on: bool) -> None:
+        # The hint goes in and out with undo off: it is not an edit of yours, so Ctrl+Z neither brings it back as
+        # text nor loses your own history.
+        if on and not self.hinting and not self.text.get("1.0", "end-1c").strip():
+            self.text.configure(undo=False)
+            self.text.delete("1.0", "end")
+            self.text.insert("1.0", self.HINT)
+            self.text.configure(undo=True, fg=COLORS["text_tertiary"])
+            self.hinting = True
+        elif not on and self.hinting:
+            self.text.configure(undo=False)
+            self.text.delete("1.0", "end")
+            self.text.configure(undo=True, fg=COLORS["text_primary"])
+            self.hinting = False
+
+    def _enter(self, event):
+        if event.state & 0x0001:  # Shift: the default binding inserts a new line
+            return None
+        text = self.value().strip()
+        if text and self.on_submit(text):
+            self.text.delete("1.0", "end")
+        return "break"
 
 
 # ---------- "back to latest" ----------

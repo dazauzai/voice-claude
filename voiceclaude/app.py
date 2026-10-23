@@ -23,7 +23,7 @@ from .ui_access import AccessPage, describe as describe_access, describe_is_erro
 from .ui_theme import (BAND_COLORS, COLORS, JOB_WORDS, PERMISSION_NAMES, PERMISSION_WORDS, STATES, Theme, ask_title, band_for,
                        classify_status, fit_hint, heard_suffix, hint_for, is_ascii, parse_job_note, permissions_summary,
                        status_display, tool_word, truncate_to_width, wrap_mode)
-from .ui_widgets import (AnsweredCard, BackToLatest, CheckRow, DockedCard, LineChip, LinePanel, NavGroup, Segmented, StateOrb,
+from .ui_widgets import (AnsweredCard, BackToLatest, CheckRow, DockedCard, LineChip, LinePanel, NavGroup, Segmented, StateOrb, TypeBox,
                          flat_button, header_padx, page_header, place_button, style_button)
 
 log = logging.getLogger(__name__)
@@ -89,6 +89,9 @@ class App:
         self._quit_requested = False  # 退出 voice-claude was chosen: the service's bye closes the window
         self.transparent = False  # 通透模式, as the service reports it (hello reply, 'transparent' events)
         self._fg_before_card = 0  # the window in front when a request card opened (a click on 可以 gives it back)
+        self._turns: dict[str, tuple[str, str, str]] = {}  # transcript tag -> (line, turn id, text) of a sent message
+        self._rewinding = False  # a rewind is on its way (the service may be asking about files, then restarting)
+        self._turn_seq = 0  # counts turns opened, so a late reply to an old one leaves the newest alone
         self._closing = False  # quit() ran: the UI loop must not reschedule itself
 
     # ---------- startup / shutdown ----------
@@ -226,6 +229,10 @@ class App:
                 return
             if not self.queued:
                 self._note("（没有排队的话）")
+                return
+            if self._rewinding:  # the line is restarting and would refuse it; the queue goes when the rewind ends
+                self._note("（撤回完成后马上发）")
+                self.speaker.say("撤回完成后马上发。")
                 return
             text = "\n".join(self.queued)
             self.queued.clear()
@@ -428,37 +435,95 @@ class App:
                     self.state = IDLE
                     self._status("空闲")
                 return
-            key = textmod.fixed_phrase(text)
-            if key == "cancel_queue":
-                self._line("你", text)
-                self._cancel_queue()
-                if not self.turn_open:
-                    self._after_turn()
-                return
-            if key == "open_access":  # a window action (the 你 line opens the access page); nothing for the daemon
-                self._line("你", text)
-                if not self.turn_open:
-                    self._after_turn()
-                return
-            if key:
-                self._line("你", text)
-                threading.Thread(target=self._phrase, args=(key,), daemon=True).start()
-                if not self.turn_open:
-                    self._after_turn()
-                return
-            if self.conversation and textmod.is_exit_phrase(text):
-                self._line("你", text)
-                self._exit_conversation()
-                self.speaker.say("好的。")
-                return
-            if self.turn_open:
-                self.queued.append(text)
-                self._line("你", f"（排队）{text}")
-                return
+            parts = self._route(text)
+        if parts:
+            self._say("\n".join(parts), parts)
+
+    def _route(self, text: str) -> list[str] | None:
+        """Lock held: what you said or typed. A fixed phrase, the queue while a turn is open, or a new turn; the
+        messages the caller must send to the line as one turn (outside the lock), else None."""
+        key = textmod.fixed_phrase(text)
+        if key == "cancel_queue":
             self._line("你", text)
-            send = self._begin_turn()
-        if send:
-            self._say(text)
+            self._cancel_queue()
+            if not self.turn_open:
+                self._after_turn()
+            return None
+        if key == "open_access":  # a window action (the 你 line opens the access page); nothing for the daemon
+            self._line("你", text)
+            if not self.turn_open:
+                self._after_turn()
+            return None
+        if key == "rewind_last":  # like 从这里重来 on your last sentence: it may ask about files and restart the line
+            self._line("你", text)
+            self._start_rewind(self.client.active, "", steps=1)
+            if not self.turn_open:
+                self._after_turn()
+            return None
+        if key:
+            self._line("你", text)
+            threading.Thread(target=self._phrase, args=(key,), daemon=True).start()
+            if not self.turn_open:
+                self._after_turn()
+            return None
+        if self.conversation and textmod.is_exit_phrase(text):
+            self._line("你", text)
+            self._exit_conversation()
+            self.speaker.say("好的。")
+            return None
+        if self.turn_open or self._rewinding:  # after the answer, or after the rewind (the line is restarting)
+            self.queued.append(text)
+            self._line("你", f"（排队）{text}")
+            if not self.turn_open:
+                self._after_turn()
+            return None
+        parts = self.queued + [text]  # anything still waiting from a rewind goes first, in the same turn
+        self.queued.clear()
+        self._line("你", text)
+        self._begin_turn()
+        return parts
+
+    def _submit_typed(self, text: str) -> bool:
+        """The text box: typed text goes where spoken text goes, and answers a request card the same way. False
+        when it was not taken (not connected yet, or a recording is running); the box then keeps it."""
+        text = text.strip()
+        if not text:
+            return False
+        with self.lock:
+            if not self.ready or self._gone() or self.state == RECORDING:
+                return False
+            log.info("you (typed): %s", text)
+            if self.state == APPROVING and self.approval is not None:
+                question = self.approval["kind"] == "question"
+                info, box = self.card_info, self.typebox
+                started, before = info.get("started", 0.0), info.get("box_text", "")
+                if before or info.get("composing"):  # something was on its way into the box: clear or write over it
+                    fresh = box.emptied_at > started or bool(before and before not in text)
+                else:
+                    fresh = box.began_at >= started + self.ANSWER_GRACE
+                fresh = fresh and self.card is not None and box.typed_at > started
+                if not fresh:  # a message begun before the card came up (or put there by the window): not an answer
+                    if self.card is not None:
+                        info["override"] = "先回答上面的问题" if question else "先回答申请：可以，还是不行？"
+                        self._hint_shown = ()
+                    return False
+                if question:
+                    self.card_info.update(heard=text, typed=True)
+                    self._resolve_approval(True, text)
+                    return True
+                answer = textmod.typed_answer(text)
+                if answer is None:  # stays in the box: most likely a message, sent once the card is answered
+                    self.card_info["override"] = "输入「可以」或「不行」回答申请"
+                    self._hint_shown = ()
+                    return False
+                self._resolve_approval(answer, via="typed", typed=text)
+                return True
+            parts = self._route(text)
+            if parts and self.endpointer is not None:
+                self.endpointer.reset()  # a sound picked up while you typed must not hold back the turn's requests
+        if parts:
+            threading.Thread(target=self._say, args=("\n".join(parts), parts), daemon=True).start()
+        return True
 
     def _after_turn(self):
         """Lock held: nothing in flight, go back to listening / idle."""
@@ -473,21 +538,40 @@ class App:
         self.splitter = textmod.SentenceSplitter()
         self.reply = ""
         self.turn_open = True
+        self._turn_seq += 1
         self.state = BUSY
         self._status("思考中…")
         self._line("Claude", "")
         return True
 
-    def _say(self, text: str):
+    def _say(self, text: str, parts: list[str] | None = None):
+        """Send to the active line. parts: the transcript lines the message is made of (queued sentences sent
+        together), for the turn id."""
+        line, seq = self.client.active, self._turn_seq  # the turn _begin_turn just opened for it
         try:
-            self.client.say(self.client.active, text)
+            r = self.client.say(line, text)
         except Exception as e:
             log.warning("say failed: %s", e)
-            with self.lock:
-                self.turn_open = False
-                self._note(f"（没发出去：{e}）")
-                self.speaker.say("后台服务没有回应。")
-                self._after_turn()
+            self._say_failed(f"（没发出去：{e}）", "后台服务没有回应。", seq)
+            return
+        if isinstance(r, dict) and r.get("ok") is False:  # e.g. the line is restarting after a rewind
+            why = str(r.get("message") or "没发出去")
+            self._say_failed(f"（{why}）", why, seq)
+            return
+        turn = r.get("turn") if isinstance(r, dict) else None
+        if turn:  # after the 你 line itself in the UI queue
+            self.ui_q.put(("call", lambda: self._mark_turn(line, str(turn), parts or [text])))
+
+    def _say_failed(self, note: str, spoken: str, seq: int | None = None):
+        """A late failure (a reply that took long) must not close a newer turn opened meanwhile."""
+        with self.lock:
+            if seq is not None and seq != self._turn_seq:  # you have said something since, which did go out
+                self._note(f"（前面那句没有发出去：{note.strip('（）')}）")
+                return
+            self._note(note)
+            self.speaker.say(spoken)
+            self.turn_open = False
+            self._after_turn()
 
     def _phrase(self, key: str):
         try:
@@ -552,6 +636,8 @@ class App:
                     self._status("空闲")
         log.info("ask %r -> %s %r", question, answer, text)
         self._check_turn_finished()
+        if not self._rewinding:
+            self._send_queued()
         return answer is True, text
 
     def _wait_for_your_sentence(self, limit: float = 30.0):
@@ -566,14 +652,17 @@ class App:
                     return
             time.sleep(0.05)
 
-    def _resolve_approval(self, answer: bool, text: str = "", via: str = ""):
-        """via: "" = by voice (or 不行 by the talk key); "key" / "button" = 可以 by the send key / the button."""
+    def _resolve_approval(self, answer: bool, text: str = "", via: str = "", typed: str = ""):
+        """via: "" = by voice (or 不行 by the talk key); "key" / "button" = 可以 by the send key / the button;
+        "typed" = an answer typed into the text box (shown on the card, not passed on)."""
         if self.approval:
             self.approval["answer"] = answer
             self.approval["text"] = text
             self.approval["event"].set()
             if self.approval["kind"] == "approve":
-                if answer and via:
+                if via == "typed":
+                    self._note(("（输入：可以）" if answer else "（输入：不行）") + typed)
+                elif answer and via:
                     self._note("（按键：可以）" if via == "key" else "（点了：可以）")
                 else:
                     self._note("（你说：可以）" if answer else "（你说：不行）")
@@ -632,6 +721,10 @@ class App:
         if kind == "transparent":
             self.ui_q.put(("call", lambda: self._show_transparent(bool(data.get("on")))))
             return
+        if kind == "rewound":
+            said = " ".join(str(data.get("text") or "").split())
+            self._note(f"—— 撤回到「{said[:20] + ('…' if len(said) > 20 else '')}」之前 ——" if said else "—— 撤回了 ——")
+            return
         if kind == "bye":
             with self.lock:
                 if self.daemon_gone:  # the client adds its own bye after the service's: one is enough
@@ -682,11 +775,11 @@ class App:
                     self.speaker.say("这一轮出错了，看一下屏幕。")
                 self.splitter = None
                 if self.queued:
-                    send_queued = "\n".join(self.queued)
+                    send_queued = list(self.queued)
                     self.queued.clear()
                     self._begin_turn()
         if send_queued:
-            threading.Thread(target=self._say, args=(send_queued,), daemon=True).start()
+            threading.Thread(target=self._say, args=("\n".join(send_queued), send_queued), daemon=True).start()
         else:
             self._check_turn_finished()
 
@@ -697,6 +790,9 @@ class App:
                 if self.turn_open and getattr(self, "turn_line", None) not in (None, data["line"]):
                     self.turn_open = False  # the switchboard moved us while the old line was still talking
                     self.splitter = None
+                    if self.queued:  # said for the old line: it must not go to this one
+                        self._note(f"（撤销了排队的 {len(self.queued)} 句：换了线）")
+                        self.queued.clear()
                 self.turn_line = data["line"]
             self._check_turn_finished()
         self._refresh_lines()
@@ -787,6 +883,7 @@ class App:
     # from those prefixes, so the voice flow above does not depend on how the window looks.
 
     ASK_SECONDS = 60  # _ask waits this long; the card counts it down
+    ANSWER_GRACE = 1.0  # a typed answer begun sooner than this after the card came up was begun for something else
 
     def _build_window(self):
         try:  # crisp text on high-DPI screens (150 % scaling is common)
@@ -923,6 +1020,8 @@ class App:
         page = tk.Frame(self.card_frame, bg=COLORS["bg_card"])
         self.pages["transcript"] = page
         page.pack(fill="both", expand=True)
+        self.typebox = TypeBox(page, t, self._submit_typed, COLORS["bg_card"])
+        self.typebox.pack(side="bottom", fill="x")
         self.textbox = tk.Text(page, wrap="char", state="disabled", bd=0, highlightthickness=0, padx=px(12), pady=px(12),
                                bg=COLORS["bg_card"], fg=COLORS["text_primary"], cursor="arrow", font=t.font("body"))
         self.scrollbar = ttk.Scrollbar(page, orient="vertical", command=self._user_yview, style="Flat.Vertical.TScrollbar")
@@ -930,6 +1029,7 @@ class App:
         self.scrollbar.pack(side="right", fill="y", pady=px(4))
         self.textbox.pack(side="left", fill="both", expand=True)
         self.textbox.bind("<Configure>", self._on_text_configure)
+        self.textbox.bind("<Button-3>", self._on_transcript_menu)
         self.back_btn = BackToLatest(page, t, self._to_latest)
         self.back_shown = False
         self.follow = True  # auto-scroll to the newest entry until you scroll up
@@ -1134,15 +1234,17 @@ class App:
     def _bind_keys(self):
         r = self.root
         r.bind("<Escape>", lambda e: self._escape())
-        r.bind("<End>", lambda e: self._to_latest())
-        r.bind("<Prior>", lambda e: self._user_yview("scroll", -1, "pages"))  # through _user_yview: stops following
-        r.bind("<Next>", lambda e: self._user_yview("scroll", 1, "pages"))
+        box = self.typebox.text
+        r.bind("<End>", lambda e: None if e.widget is box else self._to_latest())
+        r.bind("<Prior>", lambda e: None if e.widget is box else self._user_yview("scroll", -1, "pages"))  # stops following
+        r.bind("<Next>", lambda e: None if e.widget is box else self._user_yview("scroll", 1, "pages"))
         for k in ("<Control-equal>", "<Control-plus>"):
             r.bind(k, lambda e: self._set_font(self.font_size + 1))
         r.bind("<Control-minus>", lambda e: self._set_font(self.font_size - 1))
         r.bind("<Control-comma>", lambda e: self._toggle_settings())
         r.bind("<Control-l>", lambda e: self._toggle_panel())
         r.bind("<Control-t>", lambda e: self._set_topmost(not self.topmost_var.get()))
+        box.bind("<Control-t>", lambda e: (self._set_topmost(not self.topmost_var.get()), "break")[1])  # not Text's transpose
 
     def _escape(self):
         """One level back: the panel, then 权限 -> 设置, AI 服务商 -> where it was opened from, 设置 -> 对话."""
@@ -1154,6 +1256,100 @@ class App:
             self._access_back()
         elif self.page != "transcript":
             self._close_page()
+
+    # ----- rewind: right-click one of your sentences → 从这里重来 -----
+    def _mark_turn(self, line: str, turn: str, parts: list[str]) -> None:
+        """Tie the transcript lines of a sent message (one, or the queued ones sent together) to its turn id. Lines
+        still waiting in the queue are not part of it."""
+        tb = self.textbox
+        wanted = [t for t in parts if t.strip()]
+        tag = f"turn:{line}:{turn}"
+        self._turns[tag] = (line, turn, "\n".join(parts))
+        r = tb.tag_ranges("you")
+        ranges = [(str(r[i]), str(r[i + 1])) for i in range(0, len(r), 2)]
+        for start, end in reversed(ranges):
+            if not wanted:
+                break
+            body = tb.get(start, end)
+            if body in wanted and not any(t.startswith("turn:") for t in tb.tag_names(start)):
+                tb.tag_add(tag, start, end)
+                wanted.remove(body)
+
+    def _on_transcript_menu(self, event):
+        idx = self.textbox.index(f"@{event.x},{event.y}")
+        tag = next((t for t in self.textbox.tag_names(idx) if t in self._turns), None)
+        if tag is None:
+            return
+        menu = tk.Menu(self.root, tearoff=0, font=self.theme.font("ctrl"))
+        menu.add_command(label="从这里重来", command=lambda: self._rewind_to(tag))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _rewind_to(self, tag: str) -> None:
+        """Back to just before that sentence; the sentence goes into the text box to change and send again."""
+        line, turn, text = self._turns[tag]
+        self._start_rewind(line, text, turn=turn)
+
+    def _start_rewind(self, line: str, text: str, **which) -> None:
+        """which: turn=… (that sentence and after) or steps=… (the last ones). On its own thread: the service may ask
+        about files and restarts the line."""
+        fn = getattr(self.client, "rewind", None)
+        if fn is None or not self.ready or self.daemon_gone:
+            self._note("（后台服务未连接，不能撤回）" if fn is not None else "（后台服务版本过旧，不能撤回）")
+            return
+        if self._rewinding:
+            self._note("（上一次撤回还没完成）")
+            if self.speaker is not None:
+                self.speaker.say("上一次撤回还没完成。")
+            return
+        self._rewinding = True
+
+        def go():
+            try:
+                r = fn(line=line, **which)
+            except Exception as e:
+                r = {"ok": False, "message": f"没能撤回：{e}"}
+            here = True
+            if r.get("ok") and line and line != self.client.active:
+                with self.lock:  # a turn or a queue on the line in front stays there
+                    here = not self.turn_open and not self.queued
+                if here:
+                    try:
+                        self.client.switch(line)  # the corrected sentence goes to the line it was taken from
+                    except Exception as e:
+                        log.warning("switch after rewind failed: %s", e)
+                        here = False
+            self.ui_q.put(("call", lambda: self._rewound_here(r, text, here)))
+        threading.Thread(target=go, daemon=True, name="rewind").start()
+
+    def _rewound_here(self, r: dict, text: str, here: bool = True) -> None:
+        self._rewinding = False
+        said = str(r.get("message") or "")
+        if said and self.speaker is not None:
+            self.speaker.say(said)
+        back = str(r.get("text") or text)
+        if not r.get("ok"):
+            self._note(f"（{said or '没能撤回'}）")
+        elif not here:
+            self._note(f"（撤回的那句在另一条线上，没放进输入框：{back}）")
+        elif back and not self.queued:  # nothing said meanwhile: the sentence comes back to be changed
+            if self.typebox.put(back):
+                self.typebox.text.focus_set()
+            else:
+                self._note(f"（输入框里有字，撤回的那句没放进去：{back}）")
+        self._send_queued()
+
+    def _send_queued(self) -> None:
+        """What you said or typed while a rewind ran goes out now, as one turn."""
+        with self.lock:
+            if not self.queued or self.turn_open or self._gone() or self.state in (RECORDING, APPROVING):
+                return
+            parts = list(self.queued)
+            self.queued.clear()
+            self._begin_turn()
+        threading.Thread(target=self._say, args=("\n".join(parts), parts), daemon=True).start()
 
     def _set_topmost(self, on: bool):
         self.topmost_var.set(on)
@@ -1350,21 +1546,27 @@ class App:
         self._quit_requested = True
         log.info("quit: asking the service to shut down (jobs=%s)", jobs)
         self._status("正在退出…")
-        threading.Thread(target=self._shutdown_for_quit, args=(jobs, len(self._lines_snapshot[0])), daemon=True,
-                         name="quit").start()
+        threading.Thread(target=self._shutdown_for_quit, args=(jobs, len(self._lines_snapshot[0]), bool(busy)),
+                         daemon=True, name="quit").start()
 
-    def _shutdown_for_quit(self, jobs: str, n_lines: int):
+    def _shutdown_for_quit(self, jobs: str, n_lines: int, lines_confirmed: bool = False):
+        """lines_confirmed: the dialog above already asked about the lines that are answering."""
         try:
             try:
-                r = self.client.shutdown(jobs=jobs)
-            except TypeError:  # a client without the jobs argument: the service asks about jobs by voice
-                r = self.client.shutdown()
+                r = self.client.shutdown(jobs=jobs, lines_confirmed=lines_confirmed)
+            except TypeError:  # an older client: the service asks about busy lines (and, older still, jobs) by voice
+                try:
+                    r = self.client.shutdown(jobs=jobs)
+                except TypeError:
+                    r = self.client.shutdown()
         except Exception as e:
             log.warning("shutdown for quit failed: %s", e)
             self.ui_q.put(("call", self._quit_unanswered))
             return
-        if "先问" in str(r.get("message", "")):
-            return  # the service asks about the running jobs by voice; its bye closes the window
+        if "先问" in str(r.get("message", "")):  # the service asks by voice; its bye closes the window
+            wait_ms = int((self.ASK_SECONDS + 15 + 3 * max(1, n_lines)) * 1000)
+            self.ui_q.put(("call", lambda: self.root.after(wait_ms, self._quit_turned_down)))
+            return
         wait_ms = int((5 + 3 * max(1, n_lines)) * 1000)  # each line gets up to 3 s to close
         self.ui_q.put(("call", lambda: self.root.after(wait_ms, self._quit_anyway)))
 
@@ -1372,6 +1574,15 @@ class App:
         if not self._closing:
             log.info("no bye after the shutdown; closing the window anyway")
             self.quit()
+
+    def _quit_turned_down(self):
+        """No bye long after the service's question: the answer was 不行 (or none), so the window stays."""
+        if self._closing or not self._quit_requested:
+            return
+        log.info("quit: the service stayed up after its question")
+        self._quit_requested = False
+        self._status("空闲")
+        self._note("（没有退出：后台服务还开着）")
 
     def _quit_unanswered(self):
         if ask_ok(self.root, "退出 voice-claude", "后台服务未响应。\n关闭窗口？"):
@@ -1544,7 +1755,7 @@ class App:
             return
         self.back_shown = show
         if show:
-            self.back_btn.place(relx=1.0, rely=1.0, x=-self.theme.px(20), y=-self.theme.px(12), anchor="se")
+            self.back_btn.place(in_=self.textbox, relx=1.0, rely=1.0, x=-self.theme.px(8), y=-self.theme.px(12), anchor="se")
             tk.Misc.tkraise(self.back_btn)  # Canvas.lift is tag_raise; this raises the widget itself
         else:
             self.back_btn.place_forget()
@@ -1727,6 +1938,8 @@ class App:
             self._open_card(kind, q.strip(), detail.strip())
         elif s.startswith("（你说：可以）"):
             self._resolve_answer(True)
+        elif s.startswith(("（输入：可以）", "（输入：不行）")):
+            self._resolve_card("你输入：" + s[len("（输入：可以）"):], "ok" if s.startswith("（输入：可以）") else "no")
         elif s.startswith("（按键：可以）"):
             self._resolve_card(f"你按了{key_name(self.cfg.send_key)}，算可以", "ok")
         elif s.startswith("（点了：可以）"):
@@ -1786,7 +1999,8 @@ class App:
         title, line, body = ask_title(question, kind)
         self.card = DockedCard(self.dock, self.theme, kind, title, body, detail, self.hint_var, self.ASK_SECONDS)
         self.card_info = {"kind": kind, "title": title, "line": line, "body": body, "detail": detail, "heard": "",
-                          "override": "", "started": time.monotonic()}
+                          "override": "", "started": time.monotonic(), "box_text": self.typebox.value().strip(),
+                          "composing": self.typebox.composing()}
         self._card_gone_ticks = 0
         self.card.pack(fill="x")
         self.dock.pack(side="bottom", fill="x", padx=self._col_extra, pady=(self.theme.px(8), 0), before=self.card_frame)
@@ -1831,6 +2045,7 @@ class App:
     def _tick_card(self):
         if self.card is None:
             return
+        self.typebox.poll()
         remaining = self.ASK_SECONDS - (time.monotonic() - self.card_info["started"])
         self.card.set_remaining(max(0.0, remaining))
         if not self.card_info.get("fitted") and self.card.text.winfo_width() > 1:
@@ -1843,7 +2058,7 @@ class App:
             if self._card_gone_ticks >= 3:  # the resolution note, if any, has had its turn in the queue
                 heard = self.card_info.get("heard", "")
                 if self.card_info.get("kind") == "question" and heard:
-                    self._resolve_card(f"你说：{heard}", "question")
+                    self._resolve_card(f"{'你输入' if self.card_info.get('typed') else '你说'}：{heard}", "question")
                 else:
                     self._resolve_card("没有回答，算不行", "no")
         else:

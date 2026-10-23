@@ -30,6 +30,29 @@ class Project:
     aliases: list[str] = field(default_factory=list)
     session_id: str = ""  # the session the voice app used last for this project ("" = start fresh)
     session_engine: str = ""  # whose conversation that is: "claude" (Claude Code) or "codex"; "" = unknown
+    session_fork: list | None = None  # a rewind not made yet: [last entry kept, dropped prompt or None] (Claude Code)
+
+
+def transcript_tail(session_id: str, projects_dir: Path | None = None) -> str:
+    """The uuid of the last entry of a Claude Code conversation's transcript ('' when it cannot be read): where a
+    resumed conversation stood before this process's first message, so a rewind can go back to it."""
+    if not session_id:
+        return ""
+    base = projects_dir or paths.CLAUDE_PROJECTS_DIR
+    try:
+        f = next(base.glob(f"*/{session_id}.jsonl"), None)
+        if f is None:
+            return ""
+        for line in reversed(f.read_text("utf-8", errors="replace").splitlines()[-400:]):
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(d, dict) and d.get("uuid"):
+                return str(d["uuid"])
+    except OSError:
+        pass
+    return ""
 
 
 def engine_of_session(session_id: str) -> str:
@@ -186,6 +209,8 @@ def scan(claude_projects_dir: Path = paths.CLAUDE_PROJECTS_DIR, aliases_file: Pa
         if key in found and isinstance(rec, dict):
             found[key].session_id = str(rec.get("session_id", ""))
             found[key].session_engine = str(rec.get("engine") or engine_of_session(found[key].session_id))
+            fork = rec.get("fork_at")
+            found[key].session_fork = list(fork) if isinstance(fork, list) and len(fork) == 2 and fork[0] else None
     projects = sorted(found.values(), key=lambda p: p.last_active, reverse=True)
     _disambiguate(projects)
     return projects

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import logging
 import queue
 import socket
@@ -55,7 +56,7 @@ class DaemonClient:
         self.sock = sock
         self.wfile = sock.makefile("w", encoding="utf-8", newline="\n")
         rfile = sock.makefile("r", encoding="utf-8")
-        self._send({"hello": token, "role": "frontend"})
+        self._send({"hello": token, "role": "frontend", "pid": os.getpid()})
         reply = json.loads(rfile.readline() or "{}")
         if not reply.get("ok"):
             sock.close()
@@ -87,11 +88,21 @@ class DaemonClient:
     def switch(self, line: str) -> dict:
         return self._call("switch", line=line)
 
+    # The service's say waits for the line to take the words: a Codex line up to 90 s for its thread, a Claude Code
+    # line up to 30 s for an interrupted turn. Giving up sooner would report "没发出去" while it still goes out.
+    SAY_TIMEOUT = 120.0
+
     def say(self, line: str, text: str) -> dict:
-        return self._call("say", line=line, text=text)
+        return self._call("say", timeout=self.SAY_TIMEOUT, line=line, text=text)
 
     def interrupt(self, line: str) -> dict:
         return self._call("interrupt", line=line)
+
+    def rewind(self, line: str = "", turn: str | None = None, steps: int = 1) -> dict:
+        """Back to just before a sentence: `turn` (from say's reply) and everything after it, or the last `steps`
+        user turns. May ask out loud whether to put changed files back, so it can take a while: call it off the UI
+        thread. Reply: ok, message (spoken), text (the first dropped sentence), files_restored."""
+        return self._call("rewind", timeout=120.0, line=line, turn=turn, steps=steps)
 
     def stop_all(self) -> dict:
         return self._call("stop_all")
@@ -152,10 +163,11 @@ class DaemonClient:
     def reply(self, request: str, result: dict) -> None:
         self._send({"cmd": "reply", "request": request, "result": result})
 
-    def shutdown(self, jobs: str = "ask") -> dict:
+    def shutdown(self, jobs: str = "ask", lines_confirmed: bool = False) -> dict:
         """jobs: "ask" = the service asks out loud about running background jobs (an 'ask' event follows);
-        "stop" = stop them and exit; "keep" = leave them running and exit. The window asks with its own dialog."""
-        return self._call("shutdown", jobs=jobs)
+        "stop" = stop them and exit; "keep" = leave them running and exit. The window asks with its own dialog.
+        lines_confirmed: the window already asked about lines that are mid-turn; otherwise the service asks."""
+        return self._call("shutdown", jobs=jobs, lines_confirmed=lines_confirmed)
 
     # ---------- plumbing ----------
 

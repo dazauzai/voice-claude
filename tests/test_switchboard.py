@@ -1,3 +1,4 @@
+import os
 import tempfile
 import threading
 import unittest
@@ -39,6 +40,25 @@ class FakeSession:
             self.provider = provider
         if model:
             self.model = model
+
+    refuse_rewind = False
+
+    def rewind_to(self, keep, drop, single=True):
+        self.calls.append(("rewind_to", keep.get("last") or keep.get("codex_turn"), drop.get("prompt") or drop.get("codex_turn"), single))
+        if self.refuse_rewind:
+            raise RuntimeError("Claude Code 不接受这次撤回（那几轮里有没看到的内容）")
+
+    dry_files = None  # what Claude Code's dry run reports as filesChanged (None: it does not say)
+
+    still_after = None  # what a dry run right after a restore still reports (files that were not put back)
+
+    def rewind_files(self, user_message_id, dry_run=False):
+        self.calls.append(("rewind_files", user_message_id) + (("dry",) if dry_run else ()))
+        if dry_run and getattr(self, "_restored", False):
+            self._restored = False
+            return {"ok": True, "error": "", "files": self.still_after or [], "skipped": 0}
+        self._restored = not dry_run
+        return {"ok": True, "error": "", "files": self.dry_files, "skipped": 0}
 
 
 def project(name, cwd, key=None, aliases=(), session_id=""):
@@ -178,7 +198,11 @@ class SwitchboardTests(unittest.TestCase):
         self.assertEqual(self.sb.active_id, SCRATCH)
         self.assertEqual(self.sb.phrase("back_to_manager")["spoken"], "")  # announced through a notice instead
         self.assertIn("好，回到总机。", self.notices())
-        self.assertTrue(self.sb.phrase("shutdown_daemon").get("shutdown"))
+        r = self.sb.phrase("shutdown_daemon")  # Beacon is mid-turn: asked out loud, not cut off
+        self.assertFalse(r.get("shutdown"))
+        self.assertTrue(self._wait(lambda: any(k == "ask" and d["action"] == "shutdown"
+                                               and d["question"] == "Beacon还在做事，要关掉后台服务吗？" for k, d in self.events)))
+        self.assertTrue(self._wait(lambda: "没有关掉后台服务。" in self.notices()))  # nobody answered: it stays up
         self.assertIn("Beacon在干活", self.sb.phrase("background_status")["spoken"])
 
     def test_return_summary_after_background_work(self):
@@ -305,9 +329,11 @@ class SwitchboardTests(unittest.TestCase):
         self.sb.switch_to_project("Atlas")
         self.assertEqual(self.sb.active().session.resume, "")  # a new conversation, not claude --resume <codex id>
         self.sb.switch_to_project("Beacon")
-        self.projects[1].session_id, self.projects[1].session_engine = "3f2b6c1e-8d4a-4b7e-9c21-5a6d7e8f9012", "claude"
-        self.sb.index = self.sb.scan_projects()
+        import json
         self.sb._close_line(self.sb.active(), "test")
+        data = json.loads(paths.LINES_FILE.read_text("utf-8"))
+        data[self.projects[1].key] = {"session_id": "3f2b6c1e-8d4a-4b7e-9c21-5a6d7e8f9012", "engine": "claude"}
+        paths.LINES_FILE.write_text(json.dumps(data), "utf-8")
         self.sb.switch_to_project("Beacon")
         self.assertEqual(self.sb.active().session.resume, "3f2b6c1e-8d4a-4b7e-9c21-5a6d7e8f9012")  # its own engine's conversation is continued
 
@@ -364,6 +390,452 @@ class SwitchboardTests(unittest.TestCase):
         self.events.clear()
         idle.on_session("exit", 1)  # an idle line: no turn to end
         self.assertFalse(any(k == "done" for k, d in self.events))
+
+    def _turn(self, line, text, n, files=()):
+        """One user turn as the engine reports it: the prompt's uuid p<n>, the last entry a<n>, files written."""
+        r = self.sb.say(line.id, text)
+        line.on_session("mark", {"prompt": f"p{n}", "last": f"p{n}", "codex_turn": f"turn-{n}"})  # either engine's ids
+        for f in files:
+            line.on_session("tool", {"name": "Write", "input": {"file_path": f}})
+        line.on_session("mark", {"last": f"a{n}"})
+        line.on_session("done", {"status": "ok", "message": "好。"})
+        return r["turn"]
+
+    def test_rewind_by_steps_and_by_turn(self):
+        self.projects[0].session_id = ""  # a new conversation: the record reaches its first sentence
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        t1, t2, t3 = self._turn(line, "一", 1), self._turn(line, "二", 2), self._turn(line, "打开记事本输入hello然后另存为", 3)
+        self.assertTrue(t1.startswith("t") and len({t1, t2, t3}) == 3)  # say's reply carries a stable id per message
+        self.events.clear()
+        r = self.sb.rewind(line.id, steps=1)
+        self.assertEqual(r, {"ok": True, "message": "撤回到「打开记事本输入hello……」之前。", "text": "打开记事本输入hello然后另存为",
+                             "files_restored": 0})
+        self.assertIn(("rewind_to", "a2", "p3", True), line.session.calls)  # keep turn 2's last entry, drop turn 3's prompt
+        self.assertIn(("rewound", {"line": line.id, "turn": t3, "text": "打开记事本输入hello然后另存为"}), self.events)
+        self.assertEqual([e["turn"] for e in line.turn_log], [t1, t2])
+        r = self.sb.rewind("", turn=t1)  # "" = the active line; the first turn: nothing to keep, a new conversation
+        self.assertEqual((r["ok"], r["text"]), (True, "一"))
+        self.assertIn(("restart", None, None, True), line.session.calls)
+        self.assertEqual(line.turn_log, [])
+        self.assertEqual(self.sb.rewind(line.id)["message"], "没有可以撤回的话。")
+        self.assertFalse(self.sb.rewind(line.id, turn="t-unknown")["ok"])
+        t4, t5 = self._turn(line, "四", 4), self._turn(line, "五", 5)
+        r = self.sb.rewind(line.id, steps=5)  # more steps than turns: back to the start
+        self.assertEqual((r["ok"], r["text"]), (True, "四"))
+
+    def test_rewind_over_two_turns_then_one_more(self):
+        """The end-to-end case: 记住暗号：苹果 / write a file / 暗号改成：香蕉, rewound to before the second. Two turns go,
+        so the guard that checks for ONE dropped turn is not asked for; afterwards another rewind still works."""
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        t1 = self._turn(line, "记住暗号：苹果", 1)
+        t2 = self._turn(line, "用 Write 工具写 note.txt", 2)
+        self._turn(line, "暗号改成：香蕉", 3)
+        r = self.sb.rewind(line.id, turn=t2)
+        self.assertTrue(r["ok"], r)
+        self.assertIn(("rewind_to", "a1", "p2", False), line.session.calls)  # more than one turn: no drops-turn guard
+        self.assertEqual([e["turn"] for e in line.turn_log], [t1])
+        self._turn(line, "刚才的暗号是什么？", 4)
+        r = self.sb.rewind(line.id, steps=1)  # the turn record is consistent: the next rewind finds its place
+        self.assertTrue(r["ok"], r)
+        self.assertIn(("rewind_to", "a1", "p4", True), line.session.calls)
+
+    def test_a_refused_rewind_leaves_the_conversation_and_the_record_as_they_were(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self._turn(line, "一", 1)
+        self._turn(line, "二", 2)
+        before = [e["turn"] for e in line.turn_log]
+        line.session.refuse_rewind = True
+        self.events.clear()
+        r = self.sb.rewind(line.id)
+        self.assertEqual((r["ok"], r["message"]), (False, "撤回没成功：Claude Code 不接受这次撤回（那几轮里有没看到的内容）。对话保持原样。"))
+        self.assertEqual([e["turn"] for e in line.turn_log], before)
+        self.assertFalse(any(k == "rewound" for k, d in self.events))
+        line.session.refuse_rewind = False
+        self.assertTrue(self.sb.rewind(line.id)["ok"])  # nothing broken: the next one works
+
+    def test_rewind_waits_while_a_line_is_answering(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self._turn(line, "一", 1)
+        self.sb.say(line.id, "二")  # still answering
+        r = self.sb.rewind(line.id)
+        self.assertEqual((r["ok"], r["message"]), (False, "正在回答，先打断再撤回。"))
+        self.assertFalse([c for c in line.session.calls if c[0:1] == ("rewind_to",)])
+
+    def test_rewind_asks_once_about_changed_files(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        for n in ("a.txt", "b.txt", "c.txt", "d.txt", "e.txt"):
+            (Path(line.cwd) / n).write_text("old", "utf-8")  # edited, not created, by the turns below
+        self._turn(line, "一", 1)
+        self._turn(line, "写两个文件", 2, files=["a.txt", "b.txt"])
+        self._turn(line, "再改一个", 3, files=["a.txt"])
+
+        def answer():
+            self.assertTrue(self._wait(lambda: any(k == "ask" for k, d in self.events)))
+            self.sb.answer([d for k, d in self.events if k == "ask"][-1]["request"], True)
+        self.events.clear()
+        threading.Thread(target=answer, daemon=True).start()
+        r = self.sb.rewind(line.id, steps=2)
+        asks = [d for k, d in self.events if k == "ask"]
+        self.assertEqual([(a["action"], a["question"]) for a in asks], [("rewind_files", "这几轮改过 a.txt、b.txt，要一起改回去吗？")])
+        a, b = (os.path.join(line.cwd, n) for n in ("a.txt", "b.txt"))  # as written, not lowercased
+        self.assertEqual(asks[0]["detail"], f"{a}\n{b}")  # the card lists the files
+        self.assertEqual(line.session.calls[-4:], [("rewind_files", "p2", "dry"), ("rewind_files", "p2"),  # dry run first
+                                                   ("rewind_files", "p2", "dry"),  # and after: what still differs
+                                                   ("rewind_to", "a1", "p2", False)])
+        self.assertEqual((r["files_restored"], r["message"]), (2, "撤回到「写两个文件」之前。a.txt、b.txt已改回去。用命令改的文件不在内。"))
+        self._turn(line, "再写", 4, files=["c.txt"])
+        r = self.sb.rewind(line.id)  # nobody answers: the files stay
+        self.assertEqual((r["files_restored"], r["message"]), (0, "撤回到「再写」之前。文件保持现在的样子。"))
+        self.assertEqual(line.session.calls.count(("rewind_files", "p2")), 1)
+        # Claude Code's own list is the authority: it restores every file it tracks, kept turns' edits included
+        self._turn(line, "改 c", 6, files=["c.txt"])
+        kept = os.path.join(line.cwd, "config.py")
+        line.session.dry_files = [os.path.join(line.cwd, "c.txt"), kept, os.path.join(line.cwd, "x.txt")]
+        self.events.clear()
+        self.sb.rewind(line.id)
+        q = [d for k, d in self.events if k == "ask"][0]
+        self.assertEqual(q["question"], "要把 3 个文件改回去吗？其中 2 个不只是这几轮改的，会被改回那时的样子，那时还没有的会被删掉。")
+        self.assertIn(kept + "（不只是这几轮改的）", q["detail"])
+        line.session.dry_files = []
+        self._turn(line, "没改文件的一句", 7, files=["e.txt"])
+        self.events.clear()
+        r = self.sb.rewind(line.id)  # Claude Code says nothing would change: no question
+        self.assertFalse(any(k == "ask" for k, d in self.events))
+        line.session.dry_files = None
+        line.engine = "codex"  # Codex: the conversation only, no question
+        self._turn(line, "改", 5, files=["d.txt"])
+        self.events.clear()
+        r = self.sb.rewind(line.id)
+        self.assertEqual(r["message"], "撤回到「改」之前。改过的 1 个文件没有改回去（这条线只能撤回对话）。")
+        self.assertFalse(any(k == "ask" for k, d in self.events))
+
+    def test_a_resumed_line_never_loses_its_earlier_conversation(self):
+        """Yesterday's conversation resumed, one sentence today, 撤回上一句: back to where yesterday ended, not a new
+        conversation; without that point, refused."""
+        self.sb.transcript_tail = lambda sid: "y-last" if sid == "old-atlas" else ""
+        self.sb.switch_to_project("Atlas")  # resumes "old-atlas"
+        line = self.sb.active()
+        self.assertEqual((line.log_from_start, line.base_point), (False, {"last": "y-last"}))
+        self._turn(line, "把 README 标题改一下", 1)
+        r = self.sb.rewind(line.id)
+        self.assertTrue(r["ok"], r)
+        self.assertIn(("rewind_to", "y-last", "p1", True), line.session.calls)
+        self.assertNotIn(("restart", None, None, True), line.session.calls)  # no fresh start, nothing forgotten
+        self._turn(line, "又一句", 2)
+        line.base_point = None
+        r = self.sb.rewind(line.id)
+        self.assertEqual((r["ok"], r["message"]), (False, "这条线是接着以前的对话开的，撤回不到这次接上后的第一句之前。"))
+        self.assertEqual(len(line.turn_log), 1)
+
+    def test_a_rewind_is_alone_on_its_line(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self._turn(line, "一", 1)
+        self._turn(line, "二", 2, files=["a.txt"])
+        said = {}
+
+        def answer_after_speaking():
+            self.assertTrue(self._wait(lambda: any(k == "ask" for k, d in self.events)))
+            said["say"] = self.sb.say(line.id, "趁撤回时说的话")  # the window refuses too; the service must as well
+            said["rewind"] = self.sb.rewind(line.id)
+            self.sb.answer([d for k, d in self.events if k == "ask"][-1]["request"], False)
+        self.events.clear()
+        threading.Thread(target=answer_after_speaking, daemon=True).start()
+        r = self.sb.rewind(line.id)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((said["say"]["message"], said["rewind"]["message"]), ("正在撤回，稍等。", "正在撤回，稍等。"))
+        self.assertTrue(self.sb.say(line.id, "现在可以了")["ok"])
+
+    def test_a_pending_rewind_survives_closing_the_line(self):
+        """A Claude Code rewind is made real only by the next message; closing first must not bring the dropped turns
+        back: lines.json keeps the fork point, and the line opened again goes on from it."""
+        import json
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        line.session.session_id, line.session_id = "S", "S"
+        line.session.fork_at = ("a1", "p2")
+        self.sb._save_lines()
+        rec = json.loads(paths.LINES_FILE.read_text("utf-8"))[self.projects[0].key]
+        self.assertEqual((rec["session_id"], rec["fork_at"]), ("S", ["a1", "p2"]))
+        from voiceclaude import projects as projmod
+        self.assertEqual(projmod.scan(self.tmp / "none", paths.PROJECTS_FILE, paths.LINES_FILE, exists=lambda p: True), [])
+        self.sb._close_line(line, "test")  # the start-up index still says old-atlas without a fork: lines.json wins
+        self.sb.switch_to_project("Atlas")
+        again = self.sb.active()
+        self.assertEqual((again.resume_fork, again.base_point), (["a1", "p2"], {"last": "a1"}))
+
+    def test_the_question_says_what_is_deleted_and_what_was_edited_since(self):
+        """Claude created notes.md and the user then typed into it; Claude edited plan.md and the user edited it
+        afterwards: the question says both, the card marks them."""
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        cwd = Path(line.cwd)
+        (cwd / "plan.md").write_text("v1", "utf-8")
+        self._turn(line, "一", 1)
+        r = self.sb.say(line.id, "写笔记、改计划")
+        line.on_session("mark", {"prompt": "p2", "last": "p2"})
+        line.on_session("tool", {"name": "Write", "input": {"file_path": "notes.md"}})  # does not exist yet: created
+        (cwd / "notes.md").write_text("Claude 写的", "utf-8")
+        line.on_session("tool", {"name": "Edit", "input": {"file_path": "plan.md"}})
+        (cwd / "plan.md").write_text("v2 by Claude", "utf-8")
+        line.on_session("mark", {"last": "a2"})
+        line.on_session("done", {"status": "ok", "message": "好。"})  # what the files look like after the turn
+        (cwd / "plan.md").write_text("v3 by the user", "utf-8")  # the user's own edit afterwards
+        self.events.clear()
+        self.sb.rewind(line.id)
+        q = [d for k, d in self.events if k == "ask"][0]
+        self.assertEqual(q["question"], "要把 notes.md、plan.md改回去吗？notes.md是这几轮新建的，会被删掉；plan.md之后又被改过，那些改动也会没了。")
+        self.assertIn("notes.md（会被删掉）", q["detail"])
+        self.assertIn("plan.md（之后又被改过）", q["detail"])
+
+    def test_shutting_down_while_a_line_works_needs_a_yes(self):
+        closed = []
+        self.sb.shutdown_hook = lambda: closed.append(1)
+        self.assertTrue(self.sb.request_shutdown().get("shutdown"))  # nothing running: at once, as before
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self.sb.say(line.id, "重构一下")
+
+        def yes():
+            self.assertTrue(self._wait(lambda: any(k == "ask" and d["action"] == "shutdown" for k, d in self.events)))
+            self.sb.answer([d for k, d in self.events if k == "ask"][-1]["request"], True)
+        threading.Thread(target=yes, daemon=True).start()
+        self.assertFalse(self.sb.request_shutdown().get("shutdown"))
+        self.assertTrue(self._wait(lambda: closed == [1]))
+        self.assertTrue(self.sb.request_shutdown(jobs="keep").get("shutdown"))  # the window's own quit: it asked already
+
+    def test_the_windows_own_quit_after_its_own_dialog(self):
+        """× / 退出 voice-claude: the window already asked about the busy line; the service must not ask again (the
+        window would wait for a bye that never comes)."""
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self.sb.say(line.id, "重构一下")
+        self.events.clear()
+        self.assertTrue(self.sb.request_shutdown(jobs="ask", lines_confirmed=True).get("shutdown"))
+        self.assertFalse(any(k == "ask" for k, d in self.events))
+        from voiceclaude import client as clientmod
+        c = clientmod.DaemonClient(lambda k, d: None)
+        with mock.patch.object(c, "_call", lambda cmd, **kw: kw):
+            self.assertEqual(c.shutdown("ask", lines_confirmed=True), {"jobs": "ask", "lines_confirmed": True})
+            # say waits as long as the service may (a Codex thread up to 90 s): never "没发出去" while it still goes out
+            from voiceclaude import engine_codex
+            self.assertGreater(c.say("p-1", "hi")["timeout"], engine_codex.READY_TIMEOUT)
+
+    def test_a_service_question_leaves_the_line_alone(self):
+        """The shutdown question shows on the working line's card, but its turn ending meanwhile is kept, and no answer
+        does not put '申请没人回答' into that project's mailbox."""
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self.sb.say(line.id, "重构一下")
+
+        def turn_ends_while_asked():
+            self.assertTrue(self._wait(lambda: any(k == "ask" and d["action"] == "shutdown" for k, d in self.events)))
+            self.assertEqual(line.state, switchboard.WORKING)  # not flipped to WAITING by the service's question
+            line.on_session("done", {"status": "ok", "message": "重构完了。"})
+        threading.Thread(target=turn_ends_while_asked, daemon=True).start()
+        self.sb.request_shutdown()
+        self.assertTrue(self._wait(lambda: "没有关掉后台服务。" in self.notices()))
+        self.assertEqual(line.state, switchboard.IDLE)
+        self.assertFalse(any("申请没人回答" in m["text"] for m in line.mailbox))
+
+    def test_a_codex_exit_keeps_its_saved_thread(self):
+        """Codex falls back from a failed thread/resume by itself; an early exit is not that, so the thread is kept."""
+        import json
+        paths.LINES_FILE.write_text(json.dumps({self.projects[0].key: {"session_id": "old-atlas", "engine": "codex"}}), "utf-8")
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        line.engine, line.ready_seen = "codex", False
+        line.on_session("exit", 1)
+        self.assertNotIn(("restart", None, None, True), line.session.calls)
+        self.assertIn(self.projects[0].key, json.loads(paths.LINES_FILE.read_text("utf-8")))
+
+    def test_no_double_send_when_the_fresh_start_comes_while_a_send_waits(self):
+        """A Codex sentence waiting for its thread when the app-server dies: the fresh thread gets it once (the waiting
+        send goes there itself), and its record entry is kept."""
+        self.sb.switch_to_project("Atlas")  # resumed from old-atlas
+        line = self.sb.active()
+        self.assertEqual(line.started_resume, "old-atlas")
+        sent_before = len(line.session.sent)
+        line.say("第一句", "t1")
+        line.sending = True  # still inside CodexSession.send, waiting on ready
+        line.ready_seen = False  # the thread never came up
+        line.session.resume_failed = True
+        line.on_session("exit", 1)
+        self.assertIn(("restart", None, None, True), line.session.calls)
+        self.assertEqual(line.session.sent[sent_before:], ["第一句"])  # not sent a second time
+        self.assertEqual(([e["turn"] for e in line.turn_log], line.state), (["t1"], switchboard.WORKING))
+
+    def test_lines_json_survives_saves_from_many_threads(self):
+        """A Codex rewind saved from two threads at once and left lines.json unparseable (every other project then lost
+        its conversation). One lock and an atomic write: always whole, other projects' records kept."""
+        import json
+        paths.LINES_FILE.write_text(json.dumps({"c:\\other": {"session_id": "keep-me", "engine": "claude"}}), "utf-8")
+        self.sb.switch_to_project("Atlas")
+        self.sb.switch_to_project("Beacon")
+        errors = []
+
+        def hammer(n):
+            try:
+                for _ in range(40):
+                    self.sb._save_lines()
+                    if n == 0:
+                        self.sb._forget_session(self.sb.lines[self.sb.active_id])
+            except Exception as e:
+                errors.append(e)
+        threads = [threading.Thread(target=hammer, args=(n,)) for n in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        data = json.loads(paths.LINES_FILE.read_text("utf-8"))  # never half a file
+        self.assertEqual((errors, data["c:\\other"]["session_id"]), ([], "keep-me"))
+        self.assertFalse(list(paths.LINES_FILE.parent.glob("lines.json.*.tmp")))  # no temp files left behind
+
+    def test_a_sentence_said_while_a_codex_thread_resumes_can_still_be_rewound(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        line.engine = "codex"
+        line.log_from_start, line.base_point, line.turn_log = False, None, []
+        self.sb.say(line.id, "改一下 README")  # said during thread/resume: no Codex turn for it yet
+        line.on_session("ready", {"session_id": "thread-old", "base_turn": "turn-9"})
+        self.assertEqual(line.base_point, {"codex_turn": "turn-9"})
+        line.on_session("mark", {"prompt": "p1", "last": "p1", "codex_turn": "turn-10"})
+        line.on_session("done", {"status": "ok", "message": "好。"})
+        self.assertTrue(self.sb.rewind(line.id)["ok"])
+        self.assertIn(("rewind_to", "turn-9", "p1", True), line.session.calls)
+
+    def test_a_partly_failed_restore_says_what_was_not_put_back(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        for n in ("a.py", "b.py"):
+            (Path(line.cwd) / n).write_text("x", "utf-8")
+        self._turn(line, "一", 1)
+        self._turn(line, "改两个", 2, files=["a.py", "B.py"])
+        line.session.still_after = [os.path.join(line.cwd, "B.py")]  # its backup was missing: it still differs
+
+        def yes():
+            self.assertTrue(self._wait(lambda: any(k == "ask" for k, d in self.events)))
+            self.sb.answer([d for k, d in self.events if k == "ask"][-1]["request"], True)
+        self.events.clear()
+        threading.Thread(target=yes, daemon=True).start()
+        r = self.sb.rewind(line.id)
+        self.assertEqual(r["files_restored"], 1)
+        self.assertEqual(r["message"], "撤回到「改两个」之前。a.py已改回去。1 个没能改回去。用命令改的文件不在内。")
+        q = [d for k, d in self.events if k == "ask"][0]
+        self.assertIn("B.py", q["question"])  # its own spelling, not lowercased
+
+    def test_a_line_waiting_for_the_user_can_be_rewound(self):
+        """The last reply ended in a question (needs_you: WAITING). The files question must not leave it WORKING."""
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        (Path(line.cwd) / "README.md").write_text("x", "utf-8")
+        self._turn(line, "一", 1)
+        self.sb.say(line.id, "改 README")
+        line.on_session("mark", {"prompt": "p2", "last": "p2"})
+        line.on_session("tool", {"name": "Edit", "input": {"file_path": "README.md"}})
+        line.on_session("mark", {"last": "a2"})
+        line.on_session("done", {"status": "ok", "message": "改好了，要不要也改英文版？"})
+        self.assertEqual(line.state, switchboard.WAITING)
+        r = self.sb.rewind(line.id)  # nobody answers the files question
+        self.assertTrue(r["ok"], r)
+        self.assertNotEqual(line.state, switchboard.WORKING)
+
+    def test_words_the_session_refuses_leave_nothing_behind(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self._turn(line, "一", 1)
+        line.pending_note = "（说明：……）"
+        before = (line.state, [e["turn"] for e in line.turn_log])
+        with mock.patch.object(line.session, "send", side_effect=RuntimeError("Claude 正在重启，请稍后再说一遍")):
+            r = self.sb.say(line.id, "二")
+        self.assertFalse(r["ok"])
+        self.assertEqual((line.state, [e["turn"] for e in line.turn_log]), before)  # no orphan entry, not WORKING
+        self.assertEqual(line.pending_note, "（说明：……）")  # still to be said with the next words that do go through
+
+    def test_a_stale_note_is_never_said_after_the_conversation_moved_on(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self._turn(line, "一", 1)
+        self._turn(line, "二", 2)
+        line.pending_note = "（说明：a.txt已改回到「二」之前的样子，但对话没有撤回。）"
+        self.assertTrue(self.sb.rewind(line.id)["ok"])  # this time the rewind worked
+        self.assertEqual(line.pending_note, "")
+        self.sb.say(line.id, "继续")
+        self.assertEqual(line.session.sent[-1], "继续")
+
+    def test_reopening_a_project_in_the_same_run_follows_lines_json(self):
+        """Rewind, switch away, the line is closed (idle or to make room), reopen: the pending fork is continued, not the
+        whole conversation from the start-up index."""
+        self.sb.transcript_tail = lambda sid: "tail"
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self._turn(line, "一", 1)
+        self._turn(line, "二", 2)
+        line.session.session_id = line.session_id
+        line.session.fork_at = None
+
+        def rewind_to(keep, drop, single=True):
+            line.session.fork_at = (keep["last"], drop["prompt"] if single else None)
+        with mock.patch.object(line.session, "rewind_to", rewind_to):
+            self.assertTrue(self.sb.rewind(line.id)["ok"])  # saved right away, not at the next tick
+        import json
+        rec = json.loads(paths.LINES_FILE.read_text("utf-8"))[self.projects[0].key]
+        self.assertEqual(rec["fork_at"], ["a1", "p2"])
+        self.sb._close_line(line, "太多线路了")
+        self.sb.switch_to_project("Atlas")
+        again = self.sb.active()
+        self.assertEqual((again.session.resume, again.resume_fork), (line.session_id, ["a1", "p2"]))
+
+    def test_a_resumed_codex_line_rewinds_its_first_sentence_after_the_threads_last_turn(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        line.engine = "codex"
+        line.log_from_start, line.base_point, line.turn_log = False, None, []
+        line.on_session("ready", {"session_id": "thread-old", "base_turn": "turn-9"})  # what thread/resume said
+        self.assertEqual(line.base_point, {"codex_turn": "turn-9"})
+        self._turn(line, "改一下 README", 1)
+        self.assertTrue(self.sb.rewind(line.id)["ok"])
+        self.assertIn(("rewind_to", "turn-9", "p1", True), line.session.calls)
+
+    def test_a_refused_rewind_after_restoring_files_says_so_and_tells_the_model(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self._turn(line, "一", 1)
+        self._turn(line, "写文件", 2, files=["a.txt"])
+        line.session.refuse_rewind = True
+
+        def yes():
+            self.assertTrue(self._wait(lambda: any(k == "ask" for k, d in self.events)))
+            self.sb.answer([d for k, d in self.events if k == "ask"][-1]["request"], True)
+        self.events.clear()
+        threading.Thread(target=yes, daemon=True).start()
+        r = self.sb.rewind(line.id)
+        self.assertEqual((r["ok"], r["files_restored"]), (False, 1))
+        self.assertTrue(r["message"].startswith("文件已改回去，但对话没撤回："), r["message"])
+        self.sb.say(line.id, "继续")
+        self.assertTrue(line.session.sent[-1].startswith("（说明：a.txt已改回到「写文件」之前的样子，但对话没有撤回。）\n继续"))
+        self.assertEqual(line.turn_log[-1]["text"], "继续")  # the record keeps the user's own words
+
+    def test_rewind_by_voice_and_a_refused_truncation(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self._turn(line, "一", 1)
+        t2 = self._turn(line, "二", 2)
+        r = self.sb.phrase("rewind_last")  # 撤回上一句
+        self.assertEqual((r["ok"], r["spoken"], r["text"]), (True, "撤回到「二」之前。", "二"))
+        self.assertEqual([e["text"] for e in line.turn_log], ["一"])
+        line.on_session("rewind_failed", {})  # Claude Code refused the truncated conversation: as it was (no files)
+        self.assertEqual([e["turn"] for e in line.turn_log][-1], t2)
+        self.assertIn("Atlas撤回没成功（那几轮里有没看到的内容），对话保持原样。", self.notices())
+        self.sb.switch(MANAGER)
+        m = self.sb.lines[MANAGER]
+        self._turn(m, "接我到 Atlas", 9)
+        self.assertTrue(self.sb.phrase("rewind_last")["ok"])  # the manager line by the same rules
 
     def test_stop_all_kills_stuck_lines(self):
         self.sb.switch_to_project("Atlas")

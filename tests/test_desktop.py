@@ -125,7 +125,7 @@ class GateTests(unittest.TestCase):
         self.launch.assert_called_once_with("notepad")
         self.assertEqual(self.asked[-1], "为了记笔记，我想打开记事本，可以吗？")
         desktop.type_text("hello")
-        self.typed.assert_called_once_with("hello")
+        self.assertEqual([c.args[0] for c in self.typed.call_args_list], ["hello"])
         desktop.click(100, 50, "保存按钮", double=True)
         self.gui.click.assert_called_once_with(200, 100, clicks=2, button="left")
         desktop.press_keys("ctrl+s")
@@ -191,7 +191,7 @@ class BatchTests(unittest.TestCase):
         # the typing is announced for the window open_app brings up, not the one in front while asking
         self.assertEqual(self.posts[0]["question"], "为了记笔记，我想打开记事本，然后在“记事本”里输入文字：hello，可以吗？")
         self.launch.assert_called_once_with("notepad")
-        self.typed.assert_called_once_with("hello")
+        self.assertEqual([c.args[0] for c in self.typed.call_args_list], ["hello"])
         self.assertIn("1. 已打开记事本", out)
         self.assertIn("2. 已输入 5 个字", out)
 
@@ -336,7 +336,7 @@ class BatchTests(unittest.TestCase):
                 return {"ok": True, "brake": brake[0]}
             return {"ok": True, "brake": 0}
 
-        def typed_then_brake(text):
+        def typed_then_brake(text, guard=None):
             brake[0] = 1
         self.typed.side_effect = typed_then_brake
         with mock.patch.object(desktop, "_post", post), mock.patch.object(desktop.pyautogui, "press") as press:
@@ -432,7 +432,7 @@ class WindowCheckTests(unittest.TestCase):
             return True
         with mock.patch.object(desktop, "_activate", back):
             self.assertEqual(desktop._guard(plan.go), "已输入 5 个字。")
-        self.typed.assert_called_once_with("hello")
+        self.assertEqual([c.args[0] for c in self.typed.call_args_list], ["hello"])
 
     def test_a_menu_opened_since_the_request_is_left_first(self):
         plan = desktop.plan_type("hi")  # no menu while asking
@@ -491,6 +491,140 @@ class WindowCheckTests(unittest.TestCase):
         self.assertFalse(desktop._related(0, 0x7FFF0001))
         self.assertIsInstance(desktop._handler(".txt"), str)
         self.assertEqual(desktop.dialog_folder(0), "")  # reading a window's address bar: nothing for no window
+
+
+class FrontendGuardTests(unittest.TestCase):
+    """The voice-claude window: keys there are the user's words (answers to cards, fixed phrases). Never typed into,
+    pressed into or clicked by the desktop tools."""
+
+    def setUp(self):
+        self.fg = [5]
+        self.posts = []
+        mock.patch.multiple(desktop, _fg_hwnd=lambda: self.fg[0], _in_menu_mode=lambda h: False, _root=lambda h: h,
+                            _pid=lambda h: 900 if h == 77 else h, _frontend_pid=lambda: 900, _settle=lambda: None,
+                            _all_windows=lambda: {5, 77}, active_window=lambda: "voice-claude" if self.fg[0] == 77 else "笔记 - 记事本",
+                            _window_at=lambda x, y: 77 if x > 500 else 5).start()
+        mock.patch.object(desktop, "_post", lambda payload, path="ask": (self.posts.append(payload), {"ok": True})[1]).start()
+        self.typed = mock.patch.object(desktop, "_send_unicode").start()
+        self.gui = mock.patch.multiple(desktop.pyautogui, press=mock.DEFAULT, hotkey=mock.DEFAULT, click=mock.DEFAULT,
+                                       size=mock.Mock(return_value=(1280, 720))).start()
+
+    def tearDown(self):
+        mock.patch.stopall()
+
+    def test_never_typed_pressed_or_clicked_into(self):
+        self.fg[0] = 77  # the user just typed into the window's text box: it is in front
+        for out in (desktop.type_text("可以\n"), desktop.press_keys("enter"), desktop.click(600, 10, "可以按钮")):
+            self.assertIn("voice-claude 自己的窗口", out)
+        self.assertEqual(self.posts, [])  # not even asked
+        self.typed.assert_not_called()
+        self.gui["press"].assert_not_called()
+        self.gui["click"].assert_not_called()
+
+    def test_focus_moving_to_it_after_the_request_stops_the_step(self):
+        plan = desktop.plan_type("hello")  # asked while Notepad was in front
+        self.fg[0] = 77
+        with mock.patch.object(desktop, "_related", lambda fg, h, same_process=False: True):
+            out = desktop._guard(plan.go)
+        self.assertTrue(out.startswith("没有做：那是 voice-claude 自己的窗口"), out)
+        self.typed.assert_not_called()
+        self.fg[0] = 5
+        self.assertEqual(desktop._guard(desktop.plan_type("hello").go), "已输入 5 个字。")  # elsewhere it works
+
+
+class ShellShortcutTests(unittest.TestCase):
+    """Win+R and the like never reach the window in front: allowed with the voice-claude window there, and the steps
+    after them go to what they bring up. Plain keys, Alt+F4 and typing into the window stay refused."""
+
+    def setUp(self):
+        self.fg = [77]  # the user just typed the request into the voice-claude window
+        self.titles = {77: "voice-claude", 9: "运行"}
+        self.posts = []
+        mock.patch.multiple(desktop, _fg_hwnd=lambda: self.fg[0], _in_menu_mode=lambda h: False, _root=lambda h: h,
+                            _pid=lambda h: 900 if h == 77 else h, _frontend_pid=lambda: 900, _settle=lambda: None,
+                            _all_windows=lambda: {77}, active_window=lambda: self.titles.get(self.fg[0], "")).start()
+        mock.patch.object(desktop, "_post", lambda payload, path="ask": (self.posts.append(payload), {"ok": True})[1]).start()
+        self.typed = mock.patch.object(desktop, "_send_unicode").start()
+        self.gui = mock.patch.multiple(desktop.pyautogui, press=mock.DEFAULT,
+                                       hotkey=mock.Mock(side_effect=lambda *k: self.fg.__setitem__(0, 9))).start()
+
+    def tearDown(self):
+        mock.patch.stopall()
+
+    def test_win_r_then_typing_goes_to_the_run_box(self):
+        self.assertTrue(desktop.shell_shortcut(["win", "r"]) and desktop.shell_shortcut(["alt", "tab"]))
+        self.assertFalse(desktop.shell_shortcut(["alt", "f4"]) or desktop.shell_shortcut(["enter"]))
+        out = desktop.run_steps([{"tool": "press_keys", "args": {"keys": "win+r"}}, {"tool": "type_text", "args": {"text": "notepad"}},
+                                 {"tool": "press_keys", "args": {"keys": "enter"}}])
+        self.assertNotIn("没有做", out)
+        self.assertEqual(self.posts[0]["question"], "我想按Windows 键 加 R，然后在“弹出的窗口”里输入文字：notepad，然后按回车，可以吗？")
+        self.assertEqual([c.args[0] for c in self.typed.call_args_list], ["notepad"])
+        self.gui["press"].assert_called_once_with("enter")
+
+    def test_win_arrows_act_on_the_window_in_front_and_name_it(self):
+        """Win+Up maximises the window in front: never pressed into the voice-claude window, the question names the
+        window, and the steps after it stay on it."""
+        self.assertFalse(desktop.shell_shortcut(["win", "up"]) or desktop.shell_shortcut(["win", "shift", "left"])
+                         or desktop.shell_shortcut(["win", "home"]) or desktop.shell_shortcut(["ctrl", "alt", "delete"]))
+        self.assertIn("voice-claude 自己的窗口", desktop.press_keys("win+up"))
+        self.assertIn("voice-claude 自己的窗口", desktop.press_keys("ctrl+alt+delete"))
+        self.fg[0], self.titles[5] = 5, "笔记 - 记事本"
+        desktop.pyautogui.hotkey.side_effect = None  # Win+Up brings nothing up
+        out = desktop.run_steps([{"tool": "press_keys", "args": {"keys": "win+up"}}, {"tool": "type_text", "args": {"text": "hello"}}])
+        self.assertEqual(self.posts[-1]["question"], "我想在“记事本（笔记）”里：按Windows 键 加 上箭头，然后输入文字：hello，可以吗？")
+        self.assertNotIn("没有做", out)
+        self.assertEqual([c.args[0] for c in self.typed.call_args_list], ["hello"])
+
+    def test_virtual_desktops_and_more_openers(self):
+        self.assertTrue(desktop.shell_shortcut(["win", "ctrl", "left"]) and desktop.shell_shortcut(["ctrl", "win", "right"]))
+        self.assertIn("已按 win+ctrl+right", desktop.press_keys("win+ctrl+right"))  # voice-claude in front: still fine
+        for keys in (["win", "1"], ["win", "tab"], ["win", "shift", "s"], ["printscreen"], ["win", "g"]):
+            self.assertIn(set(keys), desktop.OPENERS, keys)
+        self.assertNotIn({"win", "d"}, desktop.OPENERS)
+
+    def test_a_shortcut_that_opens_nothing_keeps_the_target(self):
+        self.fg[0], self.titles[5] = 5, "笔记 - 记事本"
+        desktop.pyautogui.hotkey.side_effect = None
+        desktop.run_steps([{"tool": "type_text", "args": {"text": "a"}}, {"tool": "press_keys", "args": {"keys": "win+d"}},
+                           {"tool": "type_text", "args": {"text": "b"}}])
+        self.assertNotIn("弹出的窗口", self.posts[-1]["question"])
+
+    def test_the_run_box_is_brought_back_after_a_click_on_the_card(self):
+        """Asked step by step: Win+R opens the Run box; the user clicks 可以 for the next step, so the voice-claude window
+        is in front; the Run box, known since Win+R, is brought back and gets the text."""
+        replies = [{"ok": False, "per_step": True}, {"ok": True}, {"ok": True}]
+
+        def post(payload, path="ask"):
+            self.posts.append(payload)
+            if payload.get("action") == "type":
+                self.fg[0] = 77  # the click on 可以
+            return replies.pop(0) if replies else {"ok": True}
+
+        def back(h):
+            self.fg[0] = h
+            return True
+        with mock.patch.object(desktop, "_post", post), mock.patch.object(desktop, "_activate", back):
+            out = desktop.run_steps([{"tool": "press_keys", "args": {"keys": "win+r"}}, {"tool": "type_text", "args": {"text": "notepad"}}])
+        self.assertNotIn("没有做", out)
+        self.assertEqual([c.args[0] for c in self.typed.call_args_list], ["notepad"])
+
+    def test_plain_keys_and_alt_f4_into_the_window_stay_refused(self):
+        for keys in ("enter", "alt+f4", "y"):
+            self.assertIn("voice-claude 自己的窗口", desktop.press_keys(keys), keys)
+        self.assertIn("voice-claude 自己的窗口", desktop.type_text("可以"))
+        self.assertEqual(self.posts, [])
+        self.assertIn("已按 win+d", desktop.press_keys("win+d"))  # a single shortcut works on its own too
+
+    def test_typing_stops_when_the_foreground_changes_midway(self):
+        mock.patch.stopall()
+        sent, fg = [], [5]
+        with mock.patch.object(desktop, "_send_input", lambda arr: (sent.append(arr[0].u.ki.wScan), fg.__setitem__(0, 77 if len(sent) >= 3 else 5), 2)[2]), \
+                mock.patch.object(desktop.pyautogui, "failSafeCheck", lambda: None), mock.patch.object(desktop.time, "sleep", lambda s: None), \
+                mock.patch.multiple(desktop, _fg_hwnd=lambda: fg[0], _in_menu_mode=lambda h: False, _root=lambda h: h,
+                                    _pid=lambda h: 900 if h == 77 else h, _frontend_pid=lambda: 900, active_window=lambda: "笔记 - 记事本"):
+            out = desktop._guard(desktop.plan_type("abcdefgh").go)
+        self.assertEqual(sent, [ord("a"), ord("b"), ord("c")])  # the user clicked into the voice-claude box after "c"
+        self.assertEqual(out, "没有做：输入到一半前台窗口变了（已输入 3 个字，其余的没有输入）。停下来问用户。")
 
 
 class WireTests(unittest.TestCase):

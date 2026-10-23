@@ -425,6 +425,8 @@ class DaemonServer:
             return
         with self.lock:
             old, self.frontend = self.frontend, fe
+        if self.sb is not None:
+            self.sb.frontend_pid = int(hello.get("pid") or 0)  # the desktop tools never type into the window's process
         if old is not None:
             old.send({"event": "bye", "reason": "另一个语音端连上来了"})
             old.close()
@@ -482,6 +484,8 @@ class DaemonServer:
             return sb.say(str(cmd.get("line", "")), str(cmd.get("text", "")))
         if name == "interrupt":
             return sb.interrupt(str(cmd.get("line", "")))
+        if name == "rewind":
+            return sb.rewind(str(cmd.get("line", "") or ""), cmd.get("turn") or None, int(cmd.get("steps") or 1))
         if name == "stop_all":
             return sb.stop_all()
         if name == "answer":
@@ -516,7 +520,8 @@ class DaemonServer:
                 threading.Thread(target=self.shutdown, daemon=True).start()
             return r
         if name == "shutdown":
-            r = sb.request_shutdown(str(cmd.get("jobs", "ask") or "ask"))  # ask / stop / keep the running jobs
+            r = sb.request_shutdown(str(cmd.get("jobs", "ask") or "ask"),  # ask / stop / keep the running jobs
+                                    lines_confirmed=bool(cmd.get("lines_confirmed")))  # the window asked about busy lines
             if not r.get("ok"):
                 return {"ok": False, "message": str(r.get("spoken", ""))}
             if r.get("shutdown"):

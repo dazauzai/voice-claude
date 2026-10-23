@@ -186,6 +186,8 @@ class CodexSession:
         try:
             self._request("initialize", {"clientInfo": {"name": "voice-claude", "title": "voice-claude", "version": __version__},
                                          "capabilities": {"experimentalApi": True}}, HANDSHAKE_TIMEOUT)
+            if gen != self.generation:
+                return  # this app-server was replaced meanwhile: never talk to the next one from here
             self._notify("initialized", {})
             params = {"cwd": self.cwd, "approvalPolicy": "on-request", "sandbox": "workspace-write",
                       "developerInstructions": self.system_prompt, "model": self.model}
@@ -193,17 +195,29 @@ class CodexSession:
                 try:
                     r = self._request("thread/resume", {**params, "threadId": self.session_id}, HANDSHAKE_TIMEOUT)
                 except RuntimeError as e:
+                    if gen != self.generation or isinstance(e, CodexSession.Gone):
+                        return  # it failed because its app-server went away: not a reason for a new thread
                     log.warning("[%s] thread/resume failed (%s); starting a new thread", self.line_id, e)
                     self.session_id = ""
                     r = self._request("thread/start", params, HANDSHAKE_TIMEOUT)
             else:
                 r = self._request("thread/start", params, HANDSHAKE_TIMEOUT)
-            self.session_id = (r.get("thread") or {}).get("id") or self.session_id
             if gen != self.generation:
                 return
+            self.session_id = (r.get("thread") or {}).get("id") or self.session_id
+            ready = {"session_id": self.session_id}
+            turns = (r.get("thread") or {}).get("turns") or r.get("turns") or []
+            if isinstance(turns, list) and turns and isinstance(turns[-1], dict) and turns[-1].get("id"):
+                ready["base_turn"] = str(turns[-1]["id"])  # the last turn of a resumed thread: a rewind can fork after it
+            self.base_turn = ready.get("base_turn")
+            # the event before the flag: whoever waits for ready (a send, a rewind) finds the line already told, so the
+            # base turn is in before any turn of ours, and a rewind's own save does not race this one
+            self.on_event("ready", ready)
             self.ready.set()
-            self.on_event("ready", {"session_id": self.session_id})
         except Exception as e:
+            if gen != self.generation:
+                log.debug("[%s] the handshake of a replaced app-server ended: %s", self.line_id, e)
+                return
             log.exception("[%s] codex handshake failed", self.line_id)
             self.last_error = str(e)
             if gen == self.generation:
@@ -213,8 +227,16 @@ class CodexSession:
     def send(self, text: str) -> None:
         if self.transport is None:
             raise RuntimeError("Codex 正在重启，请稍后再说一遍")
-        if not self.ready.wait(timeout=READY_TIMEOUT):
+        gen = self.generation
+        waited = self._wait_ready(gen, READY_TIMEOUT)
+        if waited == "gone":
+            raise RuntimeError("Codex 进程已结束，这句没有发出去")
+        if waited == "timeout":
             raise RuntimeError("Codex 还没准备好，请稍后再说一遍")
+        if gen != self.generation or self.transport is None:
+            # the app-server this sentence waited for went away and another one came up: the user was told it ended,
+            # so it is not sent now behind their back (they may well have said it again)
+            raise RuntimeError("Codex 重新启动过，这句没有发出去，请再说一遍")
         self.interrupted = False
         self.turn_active = True
         self.text, self.last_error, self.turn_id = "", "", None
@@ -228,6 +250,8 @@ class CodexSession:
         try:
             r = self._request("turn/start", params, HANDSHAKE_TIMEOUT)
             self.turn_id = (r.get("turn") or {}).get("id")
+            if self.turn_id and gen == self.generation:
+                self.on_event("mark", {"codex_turn": self.turn_id})  # the point a rewind can fork after
         except Exception as e:
             log.exception("[%s] turn/start failed", self.line_id)
             if gen == self.generation:
@@ -241,7 +265,9 @@ class CodexSession:
                              daemon=True).start()
 
     def close(self) -> None:
-        self.generation += 1
+        old = self.generation
+        self.generation += 1  # retired first: the waiters woken below see it is stale
+        self._fail_pending(old)
         t, self.transport = self.transport, None
         self.ready.clear()
         self.turn_active = False
@@ -252,7 +278,9 @@ class CodexSession:
                 log.debug("[%s] close failed", self.line_id, exc_info=True)
 
     def kill(self) -> None:
+        old = self.generation
         self.generation += 1
+        self._fail_pending(old)
         t, self.transport = self.transport, None
         self.ready.clear()
         self.turn_active = False
@@ -261,6 +289,44 @@ class CodexSession:
                 t.kill()
             except Exception:
                 log.debug("[%s] kill failed", self.line_id, exc_info=True)
+
+    def rewind_to(self, keep: dict, drop: dict, single: bool = True) -> None:
+        """Continue this conversation only up to the end of the turn `keep`: Codex forks the thread there
+        (thread/fork, lastTurnId) and the line goes on in the new thread. Files are not touched (Codex cannot)."""
+        last = keep.get("codex_turn")
+        if not (last and self.session_id):
+            raise RuntimeError("找不到撤回的位置（这几轮的记录不全）")
+        waited = self._wait_ready(self.generation, READY_TIMEOUT)
+        if waited != "ready":
+            raise RuntimeError("Codex 进程已结束" if waited == "gone" else "Codex 还没准备好")
+        r = self._request("thread/fork", {"threadId": self.session_id, "lastTurnId": last}, HANDSHAKE_TIMEOUT)
+        new = (r.get("thread") or {}).get("id")
+        if not new:
+            raise RuntimeError("Codex 没有给出新的对话")
+        old = self.session_id
+        log.info("[%s] rewound: thread %s forked after turn %s -> %s", self.line_id, old[:8], last, new[:8])
+        self.session_id = new
+        self.restart()  # the new thread is resumed like any other (its id is reported on ready)
+        if self._wait_ready(self.generation, READY_TIMEOUT) == "ready" and self.session_id == new:
+            return
+        # the forked thread did not come up (resume failed, so the handshake started an empty one, or nothing came up)
+        log.warning("[%s] the forked thread %s did not come up; back to %s", self.line_id, new[:8], old[:8])
+        self.close()
+        self.session_id = old
+        self.restart()
+        raise RuntimeError("撤回后的对话没有接上")
+
+    def _wait_ready(self, gen: int, timeout: float) -> str:
+        """Wait for this app-server's thread: "ready", "gone" as soon as that app-server ended or was replaced (its
+        generation retired: no waiting out the full timeout), or "timeout"."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if gen != self.generation or self.transport is None:
+                return "gone"
+            if self.ready.wait(timeout=min(0.2, max(0.0, deadline - time.monotonic()))):
+                return "ready" if gen == self.generation else "gone"
+            if time.monotonic() >= deadline:
+                return "timeout"
 
     def restart(self, model: str | None = None, provider: str | None = None, fresh: bool = False) -> None:
         self.close()
@@ -286,21 +352,34 @@ class CodexSession:
     def _notify(self, method: str, params: dict) -> None:
         self._send({"method": method, "params": params})
 
+    class Gone(RuntimeError):
+        """A request whose app-server ended before it answered: not an answer, never a refused resume."""
+
     def _request(self, method: str, params: dict, timeout: float) -> dict:
         with self.write_lock:
             self.next_id += 1
             rid = self.next_id
-            slot = {"event": threading.Event(), "result": None, "error": None}
+            slot = {"event": threading.Event(), "result": None, "error": None, "gen": self.generation}
             self.pending[rid] = slot
         try:
             self._send({"id": rid, "method": method, "params": params})
             if not slot["event"].wait(timeout):
                 raise RuntimeError(f"{method} 超时（{int(timeout)} 秒）")
+            if slot.get("gone"):
+                raise CodexSession.Gone(f"{method}：Codex 进程已结束")
             if slot["error"] is not None:
                 raise RuntimeError(f"{method} -> {json.dumps(slot['error'], ensure_ascii=False)[:200]}")
             return slot["result"] or {}
         finally:
             self.pending.pop(rid, None)
+
+    def _fail_pending(self, gen: int) -> None:
+        """Every request still waiting on that app-server gets its answer now: it is gone (no 60-s wait, and nothing
+        that waited on it goes on with the next one)."""
+        for slot in list(self.pending.values()):
+            if slot.get("gen") == gen and not slot["event"].is_set():
+                slot["gone"] = True
+                slot["event"].set()
 
     def _read(self, transport, gen: int) -> None:
         while True:
@@ -326,10 +405,14 @@ class CodexSession:
                 log.exception("[%s] codex message handling failed", self.line_id)
         if gen == self.generation and self.transport is not None:
             code = transport.poll()
+            self.generation += 1  # retired before anyone waiting on it wakes: no handshake or turn acts on it
             self.transport = None
             self.turn_active = False
             self.ready.clear()
-            self.on_event("exit", code)
+            self._fail_pending(gen)
+            self.on_event("exit", code)  # once
+        else:
+            self._fail_pending(gen)
 
     def _dispatch(self, msg: dict) -> None:
         if "method" in msg and "id" in msg:  # a server-initiated request: answer on its own thread (it may ask the user)
@@ -364,7 +447,8 @@ class CodexSession:
                 changes = [{"path": str(c.get("path", "")), "kind": str(((c.get("kind") or {}).get("type") if isinstance(c.get("kind"), dict) else c.get("kind")) or "")}
                            for c in (item.get("changes") or []) if isinstance(c, dict)]
                 self.file_changes[str(item.get("id", ""))] = changes
-                self.on_event("tool", {"name": "Edit", "input": {"file_path": "、".join(c["path"] for c in changes)[:120]}})
+                self.on_event("tool", {"name": "Edit", "input": {"file_path": "、".join(c["path"] for c in changes)[:120],
+                                                                "files": [c["path"] for c in changes if c["path"]]}})
             elif t == "webSearch":
                 self.on_event("tool", {"name": "WebSearch", "input": {"query": str(item.get("query", ""))}})
         elif method == "turn/completed":

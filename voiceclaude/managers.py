@@ -125,3 +125,6 @@ class RulesSession:
 
     def restart(self, model: Any = None, provider: Any = None, fresh: bool = False) -> None:
         pass
+
+    def rewind_to(self, keep: dict, drop: dict, single: bool = True) -> None:
+        pass  # the rules keep no conversation

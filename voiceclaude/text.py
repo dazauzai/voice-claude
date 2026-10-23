@@ -147,31 +147,17 @@ def yes_or_no(text: str) -> bool | None:
     if None not in counts and sum(counts) > 0:
         return True
     return None
-    zh = t
-    for phrase in _ZH_ALSO_YES:
-        zh = zh.replace(phrase, "")
-    en = raw
-    for phrase in _EN_ALSO_YES:
-        en = en.replace(phrase, " ")
-    if any(w in zh for w in _ZH_NO) or any(w in _EN_NO for w in _EN_WORD.findall(en)):
-        return False
-    if "?" in text or "？" in text or "吗" in t or t.endswith(("么", "呢")):
-        return None
-    t = t.lstrip("嗯呃啊哦额")
-    if t.startswith(_YES) or t.startswith(_ZH_ALSO_YES):
-        return True
-    return None
-    core = t
-    for phrase in _ALSO_YES:
-        core = core.replace(phrase, "")
-    if any(w in core for w in _NO_ANYWHERE) or core.startswith(_NO_START):
-        return False
-    if "吗" in t or t.endswith(("么", "呢")):
-        return None
-    t = t.lstrip("嗯呃啊哦额")
-    if t.startswith(_YES):
-        return True
-    return None
+
+
+# A typed answer to a request card is one of these words and nothing else: what you type is a message far more often
+# than an answer ("好的" to the line in front, "等它跑完再提交"), so only the card's own words answer it.
+_TYPED_YES = {"可以", "同意", "允许", "确定", "确认", "批准", "ok", "okay", "yes"}
+_TYPED_NO = {"不行", "不可以", "拒绝", "不同意", "不允许", "no"}
+
+
+def typed_answer(text: str) -> bool | None:
+    t = _PUNCT.sub("", text).lower().strip(_ZH_FILLER)
+    return True if t in _TYPED_YES else False if t in _TYPED_NO else None
 
 
 # Fixed phrases the front end acts on itself (no Claude call): spoken text -> key.
@@ -181,20 +167,61 @@ _FIXED = [
     ("background_status", ("后台怎么样了", "后台怎么样", "后台进度", "后台情况", "后台做完了吗")),
     ("background_mode", ("进入后台模式", "后台模式", "切到后台", "放到后台")),
     ("shutdown_daemon", ("关掉后台服务", "关闭后台服务", "停掉后台服务")),
-    ("cancel_queue", ("撤销排队", "取消排队", "排队的别发", "排队的不要了", "刚才的别发了", "刚说的别发")),
+    ("cancel_queue", ("撤销排队", "取消排队", "排队的别发", "排队的别发了", "排队的都别发了", "排队的不要了", "刚才的别发了",
+                      "刚说的别发", "刚说的别发了")),
+    ("rewind_last", ("撤回上一句", "撤回上一句话", "撤回一句", "退回上一句", "回到上一句")),
     ("transparent_on", ("打开通透模式", "开启通透模式", "进入通透模式")),
     ("transparent_off", ("关闭通透模式", "关掉通透模式", "退出通透模式")),
     ("open_access", ("打开接入页", "打开接入", "接入设置", "打开登录页", "打开ai服务商", "打开服务商", "ai服务商")),  # handled by the front end itself
 ]
 
 
+# A fixed phrase is the whole utterance, after at most a few lead-ins and fillers ("好，回到总机", "能不能先关掉通透模式？",
+# "哎呀，说错了，撤回上一句"). Anything else goes to Claude: a phrase inside a sentence ("托盘菜单里加个选项，可以关掉后台服务"),
+# turned around ("别…", "不需要…"), put off ("等它跑完再…"), or asked about ("要不要…", "是不是…了").
+# None of the lead-ins can negate, delay or question what follows.
+_LEAD_INS = sorted({"不对", "说错了", "我说错了", "刚才说错了", "刚刚说错了", "错了", "算了", "哎呀", "不好意思", "对不起",
+                    "帮我", "给我", "麻烦你", "麻烦", "能不能", "可不可以", "可以", "要不", "不如", "请你", "你", "我要", "我想",
+                    "好的", "好了", "好嘞", "好", "行了", "行", "对了", "对", "不错", "没事了", "没事", "没问题", "可以了",
+                    "谢谢", "知道了", "明白了", "那就", "那个", "就", "现在", "先", "马上", "赶紧", "赶快", "快点", "快",
+                    "ok", "okay"}, key=len, reverse=True)
+_LEAD_FILLER = "嗯呃啊哦额吧呀啦嘛请那哎唉诶欸噢唔"  # not 了 ("关掉后台服务了" says it is done) and not 呢 / 吗 (questions)
+# Said as a clause of their own ("停！关掉通透模式", "等一下，撤回上一句"), these only add urgency to the phrases whose
+# effect is to stop or take back something; before any other phrase they could mean "not yet".
+_STOP_WORDS = ("等等", "等一下", "等下", "等会儿", "等会", "等", "停", "停下", "停一下", "不行", "不行了", "不是", "不用了", "不要",
+               "不", "别")
+_STOPPING = {"transparent_off", "cancel_queue", "rewind_last"}
+
+
+def _is_stop(clause: str) -> bool:
+    """A clause made of one stop word, said once or over again: 停 / 停停停 / 不行不行 / 等等等等."""
+    c = _without_lead_ins(clause)
+    return any(c and len(c) % len(w) == 0 and c == w * (len(c) // len(w)) for w in _STOP_WORDS)
+
+
+def _without_lead_ins(t: str) -> str:
+    while True:
+        w = next((w for w in _LEAD_INS if t.startswith(w)), None)  # before the fillers: 那就 / 那个 start with 那
+        if w is not None:
+            t = t[len(w):]
+        elif t and t[0] in _LEAD_FILLER:
+            t = t[1:]
+        else:
+            return t.rstrip(_LEAD_FILLER)
+
+
 def fixed_phrase(text: str) -> str | None:
-    """Key of the fixed phrase the text is (or ends with), else None."""
-    t = _PUNCT.sub("", text).lower().replace(" ", "")
+    """Key of the fixed phrase the text is, give or take lead-ins and fillers, else None."""
+    t = _CLAUSE.sub("", text).lower()
     if not t:
         return None
+    core = _without_lead_ins(t)
+    clauses = [c for c in _CLAUSE.split(text.lower()) if c]
+    while len(clauses) > 1 and (not _without_lead_ins(clauses[0]) or _is_stop(clauses[0])):  # "哎呀，停停停，…"
+        clauses = clauses[1:]
+    after_stop = _without_lead_ins("".join(clauses))
     for key, phrases in _FIXED:
-        if any(t == p or t.endswith(p) for p in phrases):
+        if t in phrases or core in phrases or (key in _STOPPING and after_stop in phrases):
             return key
     return None
 

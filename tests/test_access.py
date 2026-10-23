@@ -241,6 +241,9 @@ class ProviderTests(unittest.TestCase):
             self.assertNotIn(k, env)
         self.assertEqual(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1")  # what we set ourselves survives
         self.assertEqual(access.without_host_session({"claudecode": "1", "PATH": "p"}), {"PATH": "p"})
+        # the user's own Windows shell settings for Claude Code stay
+        shell = {"CLAUDE_CODE_GIT_BASH_PATH": r"D:\Git\bin\bash.exe", "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1"}
+        self.assertEqual(access.without_host_session({**shell, "CLAUDE_CODE_SESSION_ID": "x"}), shell)
 
     def test_test_provider_uses_the_providers_model_and_key(self):
         calls = []

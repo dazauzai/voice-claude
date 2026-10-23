@@ -2,9 +2,12 @@
 the user was not listening."""
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import re
 import time
+import uuid
 from typing import Any, Callable
 
 log = logging.getLogger(__name__)
@@ -29,6 +32,21 @@ def classify_done(status: str, reply: str) -> str | None:
     if tail.endswith(("？", "?")):
         return "needs_you"
     return "report"
+
+
+FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}  # the tools whose edits file checkpointing can undo
+
+
+def file_hash(path: str) -> str | None:
+    """A content fingerprint, to tell later whether a file was changed after Claude last wrote it (None: unreadable,
+    missing, or too big to bother)."""
+    try:
+        if os.path.getsize(path) > 50 * 1024 * 1024:
+            return None
+        with open(path, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        return None
 
 
 class Line:
@@ -60,6 +78,15 @@ class Line:
         self.ready_seen = False  # the process has accepted a message since it was started
         self.started_at = 0.0
         self.last_said = ""  # the user's latest words, sent again if the process died before answering them
+        # One record per user turn of the current conversation, for rewinding: our id, the words, the engine's ids
+        # (Claude Code: the prompt's uuid and the turn's last transcript entry; Codex: the turn id), files changed.
+        self.turn_log: list[dict] = []
+        self.log_from_start = True  # turn_log reaches back to the conversation's first message
+        self.base_point: dict | None = None  # where a resumed conversation stood before this process's first message
+        self.rewinding = False  # a rewind is running: no new words until it is done
+        self.pending_note = ""  # said to the model with the user's next words (a rewind that only half worked)
+        self.sending = False  # inside session.send (a Codex send waits there until its thread is ready)
+        self._say_seq = 0
 
     # ---------- lifecycle ----------
 
@@ -67,19 +94,43 @@ class Line:
         """Launch the Claude process. It is usable at once: stdin is buffered, and Claude Code only reports
         'ready' (system/init) AFTER it has accepted the first message, so nothing may wait for that event."""
         self.started_resume, self.ready_seen, self.started_at = resume or "", False, self.now()
+        self.turn_log = []  # turns of an earlier process are not known here, so they cannot be rewound
+        self.log_from_start, self.base_point = not resume, None
         self.session = self.session_factory(self, resume)
         self.session.start()
         self.state = IDLE
 
-    def say(self, text: str) -> bool:
-        """Send the user's words to Claude now."""
-        self.last_used = self.now()
+    def say(self, text: str, turn: str | None = None) -> bool:
+        """Send the user's words to Claude now. `turn` is the switchboard's id for this user message. If the session
+        refuses (it is restarting), nothing is kept: no record entry, the state and the note for the model as before."""
+        entry = {"turn": turn or "t" + uuid.uuid4().hex[:10], "text": text, "prompt": None, "last": None,
+                 "codex_turn": None, "files": set(), "created": set(), "hashes": {}}
+        before = (self.state, self.busy_since, self.reply, self.last_said)
+        self._say_seq += 1
+        mine = self._say_seq
+        self.turn_log.append(entry)  # before sending: the engine's ids for it may come back at once
         self.reply = ""
         self.last_said = text
         self.state = WORKING
         self.busy_since = self.now()
+        self.sending = True
+        try:
+            self.session.send(f"{self.pending_note}\n{text}" if self.pending_note else text)
+        except Exception:
+            self.turn_log[:] = [e for e in self.turn_log if e is not entry]
+            if self._say_seq == mine:  # nothing said since: undo this call's own changes
+                self.sending = False
+                if self.state == WORKING:  # a DEAD from the process going away meanwhile stays
+                    self.state, self.busy_since = before[0], before[1]
+                self.reply, self.last_said = before[2], before[3]
+            raise
+        self.sending = False
+        self.pending_note = ""
+        self.last_used = self.now()
         self.turns += 1
-        self.session.send(text)
+        if len(self.turn_log) > 200:
+            del self.turn_log[:-200]
+            self.log_from_start, self.base_point = False, None  # the oldest turns are no longer known
         return True
 
     def interrupt(self) -> None:
@@ -155,6 +206,10 @@ class Line:
             first = not self.session_id
             self.session_id = data.get("session_id") or self.session_id
             self.ready_seen = True
+            if data.get("base_turn") and not self.log_from_start and self.base_point is None \
+                    and not any(e.get("codex_turn") for e in self.turn_log):
+                # where a resumed Codex thread stood; a sentence said while it was being resumed has no Codex turn yet
+                self.base_point = {"codex_turn": data["base_turn"]}
             if self.state == STARTING:
                 self.state = IDLE
             self.on_event(self.id, "ready", {"session_id": self.session_id, "first": first})
@@ -162,8 +217,25 @@ class Line:
             self.reply += data
             self.last_text = self.reply
             self.on_event(self.id, "text", {"text": data})
+        elif kind == "mark":
+            # the engine's ids for the current turn (Claude Code prompt / last entry uuid, Codex turn id)
+            if self.turn_log:
+                e = self.turn_log[-1]
+                for k in ("prompt", "codex_turn"):
+                    if data.get(k) and not e[k]:
+                        e[k] = data[k]
+                if data.get("last"):
+                    e["last"] = data["last"]
         elif kind == "tool":
             inp = data.get("input", {})
+            if data.get("name") in FILE_TOOLS and self.turn_log:
+                path = inp.get("file_path") or inp.get("notebook_path")
+                e = self.turn_log[-1]
+                for f in inp.get("files") or ([path] if path else []):
+                    full = os.path.join(self.cwd, f)
+                    if f not in e["files"] and not os.path.exists(full):
+                        e.setdefault("created", set()).add(f)  # the tool call comes before it runs: a new file
+                    e["files"].add(f)
             detail = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("description") \
                 or inp.get("name") or inp.get("target") or inp.get("text") or ""
             self.on_event(self.id, "tool", {"name": data.get("name", ""), "detail": str(detail)[:120]})
@@ -171,11 +243,17 @@ class Line:
             status = data.get("status", "ok")
             last = last_sentence(data.get("message") or self.reply)
             what = classify_done(status, data.get("message") or self.reply)
-            self.state = WAITING if what == "needs_you" else IDLE
+            if self.state != DEAD:  # a turn ending after its process went away: the line stays dead (and reconnects)
+                self.state = WAITING if what == "needs_you" else IDLE
             self.busy_since = None
+            if self.turn_log:  # how the files this turn wrote look now: later edits by anyone else can be told apart
+                e = self.turn_log[-1]
+                e["hashes"] = {f: file_hash(os.path.join(self.cwd, f)) for f in e["files"]}
             if what and self.kind != "manager":  # the manager's replies are conversation, not news to keep
                 self.post(what, last if what != "error" else f"出错了：{(data.get('message') or '')[:80]}")
             self.on_event(self.id, "done", {"status": status, "last": last, "kind": what})
+        elif kind == "rewind_failed":
+            self.on_event(self.id, "rewind_failed", data or {})
         elif kind == "exit":
             busy = self.state in (WORKING, WAITING)  # the user is waiting for an answer that will never come
             self.state = DEAD

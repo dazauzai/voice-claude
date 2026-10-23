@@ -90,7 +90,11 @@ Keys inside the window: Esc closes the panel or a page, End goes back to the lat
 | Right Alt, two taps | Send the queued words now, interrupting the current turn |
 | Just talk (headphones) | Lowers, then stops its voice; its work continues; your words are queued |
 
-Fixed phrases the program understands locally (in Chinese): "回到总机" back to the manager, "接杂项" scratch line, "进入后台模式" background mode, "后台怎么样了" how is the background doing, "关掉后台服务" shut down the background service, "撤销排队" drop the queued words, "打开 AI 服务商" open the AI service page, "打开通透模式" / "关闭通透模式" transparent mode on / off, "结束对话" end the conversation.
+You can also type: the box at the bottom of the window, Enter to send, Shift+Enter for a new line. Typed text goes the same way as speech: it waits in the queue while a line is answering, fixed phrases work, and typing 可以 / 不行 answers a request card.
+
+Rewind: say or type "撤回上一句" on its own (repeatable; a sentence like "把那个提交撤回" still goes to the model), or right-click one of your sentences in the transcript → 从这里重来. The conversation goes back to just before it and the sentence goes into the box; if the dropped turns changed files, it asks whether to change them back (Codex lines can rewind only the conversation).
+
+Fixed phrases the program understands locally (in Chinese): "撤回上一句" undo the last sentence, "回到总机" back to the manager, "接杂项" scratch line, "进入后台模式" background mode, "后台怎么样了" how is the background doing, "关掉后台服务" shut down the background service, "撤销排队" drop the queued words, "打开 AI 服务商" open the AI service page, "打开通透模式" / "关闭通透模式" transparent mode on / off, "结束对话" end the conversation. Say them on their own (a lead-in such as 好, 能不能 or 帮我 is fine); inside a longer sentence they go to the model as ordinary words.
 
 ## Configuration
 
