@@ -35,13 +35,22 @@ _TOOL_EXACT = {
 }
 
 
+_DESKTOP_WORDS = ("desktop", "computer", "screenshot", "click", "type", "hotkey", "scroll", "open_app")
+
+
+def is_desktop_tool(name: str) -> bool:
+    """A tool that looks at or works the screen (the window gets out of its way)."""
+    low = (name or "").strip().lower()
+    return low not in _TOOL_EXACT and any(k in low for k in _DESKTOP_WORDS)
+
+
 def tool_word(name: str) -> str:
     """What the status bar says while Claude uses a tool (never the tool's English name)."""
     n = (name or "").strip()
     low = n.lower()
     if low in _TOOL_EXACT:
         return _TOOL_EXACT[low]
-    if any(k in low for k in ("desktop", "computer", "screenshot", "click", "type", "hotkey", "scroll", "open_app")):
+    if is_desktop_tool(low):
         return "正在操作桌面…"
     if "voiceclaude" in low or "manager" in low or "setting" in low or "permission" in low:
         return "正在改设置…"
@@ -300,7 +309,8 @@ def permissions_summary(table: dict, transparent: bool = False) -> str:
 PERMISSION_NAMES = {"screenshot": "查看屏幕", "click": "点击", "type": "输入文字", "hotkey": "按快捷键", "scroll": "滚动",
                     "open_app": "打开应用", "switch_model": "切换模型", "batch": "批量批准", "other_connectors": "其他连接器",
                     "background_job": "后台运行命令", "switch_provider": "切换服务商",
-                    "codex_shell": "Codex 沙箱外命令", "codex_edit": "Codex 改工作区外文件"}
+                    "codex_shell": "Codex 沙箱外命令", "codex_edit": "Codex 改工作区外文件",
+                    "send_to_session": "发给其他 Claude 会话"}
 PERMISSION_WORDS = {"ask": "询问", "allow": "允许", "deny": "禁止"}
 
 

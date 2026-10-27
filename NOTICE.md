@@ -10,9 +10,28 @@ voice-claude 是独立的开源项目，与 Anthropic、OpenAI 没有关联，�
 |---|---|---|---|
 | SenseVoice-Small（FunAudioLLM / FunASR，经 sherpa-onnx 导出的 int8 ONNX，2024-07-17） | 语音识别（中英混说） | FunASR Model License v1.1（[原文](https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE)） | 允许使用、复制、修改、分享，**要求署名并保留模型名**；条款写明"仅供参考学习"，商用条款模糊；许可方可以修改条款。voice-claude 不打包它，只在下载脚本里引用发布地址 |
 | Silero VAD（snakers4/silero-vad） | 判断"说完了" | MIT | 无 |
+| sherpa-onnx 唤醒词模型 kws-zipformer-zh-en-3M-2025-12-20（k2-fsa，[模型页](https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html)） | 唤醒词（值守，可选） | Apache-2.0 | 无；下载脚本只留 voice-claude 用到的 5 个文件 |
 | Kokoro-82M 多语言 v1.1-zh（hexgrad，[模型页](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)，经 sherpa-onnx 导出） | 朗读 | Apache-2.0 | 它的英文发音用到 **espeak-ng 的数据文件**（`espeak-ng-data/`，**GPL-3.0**）；中文分词用 cppjieba 的词典（`dict/`，MIT）。voice-claude 不打包这些文件，用户自己下载 |
 
 下载来源（`scripts/download_models.py` 自动选能连上的）：sherpa-onnx 的 GitHub 发布页（github.com/k2-fsa/sherpa-onnx/releases）；或者 Hugging Face 上 sherpa-onnx 维护者的同一批文件（huggingface.co/csukuangfj/…），直接下载或经第三方镜像 hf-mirror.com。Python 包来自 PyPI 或清华镜像（pypi.tuna.tsinghua.edu.cn）。`install.bat` 不逐个询问许可证；单独运行 `scripts/download_models.py`（不带 `--yes`）会先列出它们。
+
+## 白板（随仓库分发，在 `voiceclaude/whiteboard/vendor/`）
+
+| 包 | 用途 | 许可证 |
+|---|---|---|
+| [Excalidraw](https://github.com/excalidraw/excalidraw) 0.18.1 | 白板本身（页面、画笔、图形、导出） | MIT（`vendor/licenses/excalidraw-LICENSE`） |
+| React / ReactDOM 18.3.1 | Excalidraw 的运行库 | MIT（`vendor/licenses/react-LICENSE`） |
+| Excalidraw 的依赖（roughjs、jotai、pako、perfect-freehand、nanoid、radix-ui 等，见 `vendor/manifest.json`） | 随 Excalidraw 的浏览器构建一起打包，来自 esm.sh | 各自 MIT / ISC / BSD |
+| Excalidraw 的字体（Excalifont、Virgil、Cascadia、Assistant、Liberation、Nunito、Lilita、Comic Shanns） | 白板文字 | OFL-1.1 / MIT / Apache-2.0，随 Excalidraw 发布 |
+
+中文手写字体 Xiaolai（13 MB）不在仓库里：没有它，白板上的中文用系统字体显示。
+
+## 形象与生图脚本
+
+| 内容 | 来源 | 许可证 |
+|---|---|---|
+| `voiceclaude/assets/`（图标、头像、标准图、胖鱼）与 `docs/mascot/` | voice-claude 的原创形象 Cadence 与胖鱼（设计见 `docs/mascot/design.md`） | 随仓库 MIT |
+| `scripts/mascot/generate_codex.py` | [Neko3000/deepseek-whalechan](https://github.com/Neko3000/deepseek-whalechan) 的 Codex 生图适配器，原样使用 | MIT（Copyright (c) 2026 Neko3000 and contributors）；该仓库的角色参考图**不在**本项目中 |
 
 ## Python 依赖（`pip install` 时由用户安装，不随仓库分发）
 
@@ -26,6 +45,7 @@ voice-claude 是独立的开源项目，与 Anthropic、OpenAI 没有关联，�
 | pyscreeze / pytweening / pygetwindow / pymsgbox（pyautogui 的依赖） | 同上 | MIT / MIT / BSD / BSD 风格 |
 | **mouseinfo**（pyautogui 的依赖） | pyautogui 自带的小工具，voice-claude 不直接使用 | **GPL-3.0 或更高**。它只是 pip 依赖、不随 voice-claude 分发；如果你要把 voice-claude 打成独立安装包（把依赖打进去），这一项需要单独考虑 |
 | Pillow | 截图编码 | MIT-CMU（HPND） |
+| pywebview（及其依赖 pythonnet、bottle、proxy_tools） | 白板的独立窗口（用 Windows 自带的 WebView2） | BSD-3-Clause（pythonnet MIT，bottle MIT） |
 | claude-agent-sdk（可选） | 没装官方 Claude Code 的人用它自带的 Claude Code 程序 | SDK 的代码是 MIT；**SDK 和它内含的 Claude Code 程序的使用按 Anthropic 的商业服务条款（Commercial Terms of Service）**，见 [Agent SDK 文档](https://code.claude.com/docs/en/agent-sdk/overview) |
 | litellm[proxy]（可选） | 用 OpenAI API key 时的本机翻译层 | litellm 本身 MIT；`[proxy]` 会带上几十个依赖包，各有自己的许可证，其中 **litellm-enterprise 是 BerriAI 的私有许可证**（voice-claude 不用其中的企业功能），psycopg 是 LGPL-3.0 |
 

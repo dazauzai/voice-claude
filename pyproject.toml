@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voice-claude"
-version = "0.2.0"
+version = "0.3.0"
 description = "Talk to Claude Code (and other models) by voice on Windows: Mandarin + English, speech in and out fully local, every action approved out loud."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -32,6 +32,7 @@ dependencies = [
     "mcp>=2",
     "pyautogui",
     "pillow",
+    "pywebview",
 ]
 
 [project.optional-dependencies]

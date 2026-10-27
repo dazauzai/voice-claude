@@ -12,11 +12,11 @@ LINE = os.environ.get("VOICECLAUDE_LINE", "manager")
 server = MCPServer("manager", instructions="总机的工具：查项目清单、转接到项目、新建项目、报告后台情况、记别名。")
 
 
-def call(path: str, **data) -> str:
+def call(endpoint: str, /, **data) -> str:  # positional-only: a tool argument may be called `path`
     if not PORT:
         return "后台服务没有在运行（VOICECLAUDE_PORT 未设置）。"
     body = json.dumps({**data, "line": LINE}).encode("utf-8")
-    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/{path}", data=body, method="POST",
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/{endpoint}", data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=120) as r:

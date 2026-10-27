@@ -24,6 +24,16 @@ class TestRunnerGuardTests(unittest.TestCase):
         self.assertTrue(str(paths.HOME_DIR).startswith(tempfile.gettempdir()), paths.HOME_DIR)
 
     def test_no_real_claude_gateway_or_daemon(self):
+        """The guard refuses each real starter. Under a runner the guard does not recognise, a process start fails here
+        instead of starting Claude Code, the gateway or the service for real."""
+        if os.name == "nt":
+            block = mock.patch.object(subprocess._winapi, "CreateProcess", side_effect=AssertionError("would start a real process"))
+        else:
+            block = mock.patch.object(subprocess, "_fork_exec", side_effect=AssertionError("would start a real process"))
+        with block, mock.patch.object(subprocess, "_USE_POSIX_SPAWN", False, create=True):
+            self._refused_everywhere()
+
+    def _refused_everywhere(self):
         s = ClaudeSession(config.Config(), "P", lambda k, d: None, line_id="guard")
         with self.assertRaises(RuntimeError):
             s.start()

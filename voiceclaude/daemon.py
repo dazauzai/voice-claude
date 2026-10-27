@@ -484,6 +484,8 @@ class DaemonServer:
             return sb.say(str(cmd.get("line", "")), str(cmd.get("text", "")))
         if name == "interrupt":
             return sb.interrupt(str(cmd.get("line", "")))
+        if name == "usage":
+            return sb.usage_report()
         if name == "rewind":
             return sb.rewind(str(cmd.get("line", "") or ""), cmd.get("turn") or None, int(cmd.get("steps") or 1))
         if name == "stop_all":
@@ -563,8 +565,9 @@ def wait_finished(server: DaemonServer, timeout: float = 30.0) -> bool:
 
 def write_info(server: DaemonServer, control_port: int) -> None:
     paths.ensure()
+    board_token = server.sb.boards.token if server.sb else ""  # the whiteboard page's key to /board/api
     paths.DAEMON_INFO.write_text(json.dumps({"port": server.port, "pid": os.getpid(), "token": server.token,
-                                             "control_port": control_port, "protocol": PROTOCOL,
+                                             "control_port": control_port, "board_token": board_token, "protocol": PROTOCOL,
                                              "started": time.strftime("%Y-%m-%d %H:%M:%S")}), "utf-8")
 
 
@@ -579,7 +582,12 @@ def build(cfg: config.Config, *, port: int = 0, session_factory=None, scan_proje
         line_id = str(data.pop("line", "") or "")
         return server.sb.control_request(line_id, path, data) if server.sb else {"ok": False, "message": "还没准备好"}
 
-    control = ControlServer(control_handler)
+    def board_handler(method: str, path: str, headers: dict, body: bytes | None):
+        if not server.sb:
+            return 503, "text/plain; charset=utf-8", "还没准备好".encode("utf-8")
+        return server.sb.boards.handle(method, path, headers, body)
+
+    control = ControlServer(control_handler, web=board_handler)
     kwargs = {"jobs": jobs, "emit": server.emit, "forward": server.forward, "control_port": control.port,
               "ask_timeout": ask_timeout}
     if session_factory:
@@ -589,6 +597,7 @@ def build(cfg: config.Config, *, port: int = 0, session_factory=None, scan_proje
     if detect_access:
         kwargs["detect_access"] = detect_access
     sb = Switchboard(cfg, **kwargs)
+    sb.boards.port = control.port
     jobs.on_change = sb.on_job_change
     sb.shutdown_hook = server.shutdown
     server.sb = sb

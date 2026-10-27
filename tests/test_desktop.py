@@ -1,3 +1,4 @@
+import io
 import os
 import tempfile
 from pathlib import Path
@@ -220,7 +221,7 @@ class BatchTests(unittest.TestCase):
         self.assertIn("后面的步骤没有做", out)
         self.assertNotIn("3.", out)
         out = desktop.run_steps([{"tool": "type_text", "args": {"text": "x", "window": "evil"}}])  # an internal argument
-        self.assertEqual(self.posts[-1]["facts"], [{"kind": "type", "text": "x", "window": "W"}])
+        self.assertEqual(self.posts[-1]["facts"], [{"kind": "type", "text": "x", "window": "W", "program": "", "session": False}])
 
     def test_save_as_dialog_after_ctrl_s_takes_the_typing(self):
         """[open 记事本, type, Ctrl+S, type a name, Enter]: the name goes into the Save As dialog Notepad opened."""
@@ -307,7 +308,8 @@ class BatchTests(unittest.TestCase):
         self.titles[1] = "另存为"
         with mock.patch.object(desktop, "dialog_folder", lambda h: r"C:\Users\you\Documents"):
             self.assertEqual(desktop.plan_type("test.txt").facts,
-                             {"kind": "type", "text": "test.txt", "window": "另存为", "folder": r"C:\Users\you\Documents"})
+                             {"kind": "type", "text": "test.txt", "window": "另存为", "program": "", "session": False,
+                              "folder": r"C:\Users\you\Documents"})
         self.titles[1] = "笔记 - 记事本"
         with mock.patch.object(desktop, "dialog_folder", side_effect=AssertionError("not a save dialog")):
             self.assertNotIn("folder", desktop.plan_type("x").facts)
@@ -408,6 +410,52 @@ class WindowCheckTests(unittest.TestCase):
     def tearDown(self):
         mock.patch.stopall()
 
+    def test_win_v_puts_into_the_window_behind_and_carries_its_facts(self):
+        """Clipboard history (and the emoji panel) pastes into the window behind it: the steps after it go there, and
+        a Claude session there makes them messages to it."""
+        with mock.patch.object(desktop, "window_facts", lambda h: {"program": "Claude.exe", "session": True}):
+            plan = desktop.plan_press("win+v")
+        self.assertEqual((plan.facts["session"], plan.opens, plan.window.hwnd), (True, None, 10))
+        self.assertNotIn({"win", "v"}, desktop.OPENERS)
+
+    def test_open_app_says_what_it_will_run(self):
+        with mock.patch.object(desktop, "apps", lambda: {"便签": "claude"}), \
+                mock.patch.object(desktop, "resolve_app", lambda name, table: ("便签", "claude")):
+            self.assertEqual(desktop.plan_open("便签").facts, {"kind": "open_app", "name": "便签", "command": "claude"})
+
+    def test_long_or_several_line_text_goes_in_by_one_paste(self):
+        """Typed, each line break is an Enter (a chat box sends what is there so far) and 2000 characters take half a
+        minute. Pasted: one Ctrl+V, line breaks stay line breaks; a trailing line break is still Enter; the clipboard's
+        earlier text comes back. Into a terminal, a line break must run the line: typed as before."""
+        board = ["earlier"]
+        sets = []
+
+        def put(t):
+            sets.append(t)
+            board[0] = t
+
+        mock.patch.multiple(desktop, clipboard_text=lambda: board[0], set_clipboard_text=put).start()
+        mock.patch.object(desktop.time, "sleep", lambda s: None).start()
+        decisions = 'D1：同意。\nD2：同意。\n'
+        out = desktop._guard(desktop.plan_type(decisions).go)
+        self.assertEqual(out, "已粘贴 13 个字，然后按了回车。")
+        self.assertEqual(sets, ["D1：同意。\r\nD2：同意。", "earlier"])  # then the clipboard as it was
+        self.gui["hotkey"].assert_called_once_with("ctrl", "v")
+        self.gui["press"].assert_called_once_with("enter")
+        self.typed.assert_not_called()
+        self.assertTrue(desktop.pastes("x" * 301))
+        self.assertFalse(desktop.pastes("short, one line"))
+        self.assertFalse(desktop.pastes("hello\n"))  # one line and Enter: typed, as before
+        self.assertFalse(desktop.pastes("dir\ncd ..\n", "Windows PowerShell"))  # a terminal runs each line
+        self.assertFalse(desktop.pastes("x" * 400, "proj", "WindowsTerminal.exe"))
+        sets.clear()
+        self.gui["hotkey"].reset_mock()
+        plan = desktop.plan_type("x" * 400)
+        self.fg[0] = 11  # the focus moved away before the paste
+        with mock.patch.object(desktop, "_activate", lambda h: False):
+            self.assertTrue(desktop._guard(plan.go).startswith("没有做"))
+        self.gui["hotkey"].assert_not_called()
+
     def test_focus_moved_away_and_cannot_come_back(self):
         plan = desktop.plan_type("hello")
         self.assertEqual(plan.what, "在“记事本（笔记）”里输入文字：hello")
@@ -493,17 +541,141 @@ class WindowCheckTests(unittest.TestCase):
         self.assertEqual(desktop.dialog_folder(0), "")  # reading a window's address bar: nothing for no window
 
 
+class OwnWindowInScreenshotTests(unittest.TestCase):
+    """The voice-claude window is framed in orange and its place is given: what it shows is the conversation with the
+    user, never the window being worked on (a line once took its own plan there for a message already sent)."""
+
+    def shot(self, rect):
+        from PIL import Image as PILImage
+        screen = PILImage.new("RGB", (2560, 1440), (255, 255, 255))
+        with mock.patch.object(desktop.pyautogui, "screenshot", lambda: screen),                 mock.patch.object(desktop.pyautogui, "size", lambda: (2560, 1440)),                 mock.patch.object(desktop, "own_windows", lambda: [rect] if rect else []), mock.patch.object(desktop, "active_window", lambda: "Claude"):
+            text, image = desktop.plan_screenshot().go()
+        return text, PILImage.open(io.BytesIO(image.data))
+
+    def test_framed_and_placed(self):
+        text, img = self.shot((2000, 100, 400, 300))  # physical pixels; the shot is half size
+        self.assertIn("语音助手自己的窗口在 (1000, 50) 起、宽 200 高 150", text)
+        self.assertIn("不能当作对方的状态或已经发出去的证据", text)
+        r, g, b = img.getpixel((1000, 120))  # its left edge
+        self.assertTrue(r > 200 and 90 < g < 190 and b < 80, (r, g, b))
+        self.assertEqual(img.getpixel((900, 120)), (255, 255, 255))
+
+    def test_partly_off_screen_or_not_there(self):
+        text, _ = self.shot((2400, -50, 400, 300))
+        self.assertIn("(1200, 0) 起、宽 80 高 125", text)  # cut to the screen
+        for rect in (None, (3000, 0, 400, 300)):  # minimised or not found; on another screen: said, not left out
+            self.assertIn(desktop.NOT_MARKED, self.shot(rect)[0])
+
+    def test_a_window_on_the_move_is_not_marked_where_it_was(self):
+        """It shrinks to a corner when desktop steps begin: read before and after the capture; taken again once."""
+        from PIL import Image as PILImage
+        screen = PILImage.new("RGB", (2560, 1440), (255, 255, 255))
+        moves = iter([[(0, 0, 2000, 1400)], [(2200, 1300, 300, 72)], [(2200, 1300, 300, 72)], [(2200, 1300, 300, 72)]])
+        shots = []
+        with mock.patch.object(desktop.pyautogui, "screenshot", lambda: (shots.append(1), screen)[1]), \
+                mock.patch.object(desktop.pyautogui, "size", lambda: (2560, 1440)), mock.patch.object(desktop.time, "sleep", lambda s: None), \
+                mock.patch.object(desktop, "own_windows", lambda: next(moves)), mock.patch.object(desktop, "active_window", lambda: "Claude"):
+            text, _ = desktop.plan_screenshot().go()
+        self.assertEqual(len(shots), 2)
+        self.assertIn("(1100, 650) 起、宽 150 高 36", text)  # where it is in the picture taken again
+        moving = iter([[(0, 0, 10, 10)], [(5, 5, 10, 10)], [(9, 9, 10, 10)], [(12, 12, 10, 10)]])
+        with mock.patch.object(desktop.pyautogui, "screenshot", lambda: screen), mock.patch.object(desktop.pyautogui, "size", lambda: (2560, 1440)), \
+                mock.patch.object(desktop.time, "sleep", lambda s: None), mock.patch.object(desktop, "own_windows", lambda: next(moving)), \
+                mock.patch.object(desktop, "active_window", lambda: "Claude"):
+            self.assertIn(desktop.MOVING, desktop.plan_screenshot().go()[0])
+
+    def test_marking_fails_quietly(self):
+        from PIL import Image as PILImage
+        with mock.patch("PIL.ImageDraw.Draw", side_effect=RuntimeError("no draw")):
+            self.assertEqual(desktop.mark_own_windows(PILImage.new("RGB", (100, 100)), 1.0, [(0, 0, 50, 50)]), "")
+
+    def test_another_copy_of_voice_claude_is_ours_too(self):
+        with mock.patch.object(desktop, "_class", lambda h: "TkTopLevel"), mock.patch.object(desktop, "_title", lambda h: {
+                1: "论文 — voice-claude", 2: "voice-claude", 3: "app.py - voice-claude - Visual Studio Code"}.get(h, "")), \
+                mock.patch.object(desktop, "_pid", lambda h: 999):
+            self.assertTrue(desktop.is_frontend(1, pid=5))  # not this window's process: another copy, by its title
+            self.assertTrue(desktop.is_frontend(2, pid=5))
+            self.assertFalse(desktop.is_frontend(3, pid=5))
+
+
+class ClaudeSessionWindowTests(unittest.TestCase):
+    """Typing into a window where a Claude session runs gives it the words: the gate needs to know (by process)."""
+
+    def test_the_claude_app_or_a_terminal_running_claude_code(self):
+        procs = [(10, 1, "windowsterminal.exe"), (11, 10, "pwsh.exe"), (12, 11, "claude.exe"),
+                 (20, 1, "windowsterminal.exe"), (21, 20, "pwsh.exe"),
+                 (30, 1, "cmd.exe"), (31, 30, "conhost.exe"), (32, 30, "claude.exe")]
+        pids = {101: 10, 201: 20, 301: 31, 401: 40}
+        images = {101: "WindowsTerminal.exe", 201: "WindowsTerminal.exe", 301: "conhost.exe", 401: "Claude.exe", 501: "notepad.exe"}
+        with mock.patch.object(desktop, "_processes", lambda: procs), mock.patch.object(desktop, "_pid", lambda h: pids.get(h, 0)), \
+                mock.patch.object(desktop, "_process_image", lambda h: images.get(h, "")):
+            self.assertTrue(desktop.runs_claude(101))  # Claude Code in this terminal
+            self.assertTrue(desktop.runs_claude(201))  # another terminal, while Claude Code runs in some console: asked
+            self.assertTrue(desktop.runs_claude(301))  # a classic console: claude.exe sits next to its host
+            self.assertTrue(desktop.runs_claude(401))  # the desktop app: its Code-tab sessions take what is typed
+            self.assertFalse(desktop.runs_claude(501))
+            self.assertEqual(desktop.window_facts(401), {"program": "Claude.exe", "session": True})
+            self.assertEqual(desktop.window_facts(0), {})
+        # VS Code with Claude Code in its terminal; a terminal while Claude Code runs only under the desktop app
+        procs = [(50, 1, "code.exe"), (51, 50, "code.exe"), (52, 51, "pwsh.exe"), (53, 52, "claude.exe"),
+                 (60, 1, "claude.exe"), (61, 60, "claude.exe"), (20, 1, "windowsterminal.exe"), (21, 20, "pwsh.exe")]
+        pids = {601: 50, 201: 20}
+        images = {601: "Code.exe", 201: "WindowsTerminal.exe"}
+        with mock.patch.object(desktop, "_processes", lambda: procs), mock.patch.object(desktop, "_pid", lambda h: pids.get(h, 0)), \
+                mock.patch.object(desktop, "_process_image", lambda h: images.get(h, "")):
+            self.assertTrue(desktop.runs_claude(601))
+        procs = [p for p in procs if p[0] < 50 or p[0] >= 60]  # without VS Code's: only the desktop app's own
+        with mock.patch.object(desktop, "_processes", lambda: procs), mock.patch.object(desktop, "_pid", lambda h: pids.get(h, 0)),                 mock.patch.object(desktop, "_process_image", lambda h: images.get(h, "")):
+            self.assertFalse(desktop.runs_claude(201))
+
+    def check(self, procs, pids, images, expect):
+        with mock.patch.object(desktop, "_processes", lambda: procs), mock.patch.object(desktop, "_pid", lambda h: pids.get(h, 0)), \
+                mock.patch.object(desktop, "_process_image", lambda h: images.get(h, "")):
+            for h, want in expect.items():
+                self.assertEqual(desktop.runs_claude(h), want, h)
+                self.assertEqual(desktop.window_facts(h).get("session"), want, h)
+
+    def test_the_review_trees(self):
+        """Shapes of process trees from this machine and from the review (all fakes)."""
+        # the desktop app is a child of Explorer: Explorer's windows (Run box, taskbar, folders) are not Claude's
+        self.check([(1, 0, "explorer.exe"), (15704, 1, "claude.exe"), (2324, 15704, "claude.exe")],
+                   {9: 1, 8: 15704}, {9: "explorer.exe", 8: "Claude.exe"}, {9: False, 8: True})
+        # Claude Code started straight from Win+R: its console window belongs to conhost, a child of claude.exe
+        self.check([(1, 0, "explorer.exe"), (100, 1, "claude.exe"), (101, 100, "conhost.exe")], {7: 101}, {7: "conhost.exe"}, {7: True})
+        # ...the same handed over to Windows Terminal (its tree holds no claude.exe)
+        self.check([(1, 0, "explorer.exe"), (2, 0, "svchost.exe"), (100, 1, "claude.exe"), (101, 100, "conhost.exe"),
+                    (300, 2, "windowsterminal.exe")], {6: 300}, {6: "WindowsTerminal.exe"}, {6: True})
+        # WSL in a tab: what runs inside cannot be seen
+        self.check([(10, 1, "windowsterminal.exe"), (11, 10, "wsl.exe")], {5: 10}, {5: "WindowsTerminal.exe"}, {5: True})
+        # the desktop app, its sessions and voice-claude's lines do not make an idle terminal Claude's
+        self.check([(1, 0, "explorer.exe"), (15704, 1, "claude.exe"), (2324, 15704, "claude.exe"), (20, 1, "windowsterminal.exe"),
+                    (21, 20, "pwsh.exe"), (704, 1, "pythonw.exe"), (31412, 704, "claude.exe")], {4: 20}, {4: "WindowsTerminal.exe"}, {4: False})
+        # a window whose program cannot be read is looked into all the same
+        self.check([(1, 0, "explorer.exe"), (100, 1, "claude.exe"), (101, 100, "conhost.exe")], {3: 101}, {3: ""}, {3: True})
+
+    def test_a_window_that_turns_out_to_run_claude_when_the_step_acts(self):
+        """Facts are read when the step is asked; a window brought up later (after Win+R, a click) is checked again
+        when the step acts: a step not asked as a message to that session is not done."""
+        with mock.patch.object(desktop, "runs_claude", lambda h: h == 7):
+            self.assertTrue(desktop.unasked_session(7, {"kind": "type"}).startswith("没有做"))
+            self.assertEqual(desktop.unasked_session(7, {"kind": "type", "session": True}), "")
+            self.assertEqual(desktop.unasked_session(8, {"kind": "type"}), "")
+
+
 class FrontendGuardTests(unittest.TestCase):
     """The voice-claude window: keys there are the user's words (answers to cards, fixed phrases). Never typed into,
     pressed into or clicked by the desktop tools."""
 
     def setUp(self):
         self.fg = [5]
+        self.z = [77]  # nothing behind it
         self.posts = []
         mock.patch.multiple(desktop, _fg_hwnd=lambda: self.fg[0], _in_menu_mode=lambda h: False, _root=lambda h: h,
                             _pid=lambda h: 900 if h == 77 else h, _frontend_pid=lambda: 900, _settle=lambda: None,
                             _all_windows=lambda: {5, 77}, active_window=lambda: "voice-claude" if self.fg[0] == 77 else "笔记 - 记事本",
-                            _window_at=lambda x, y: 77 if x > 500 else 5).start()
+                            _window_at=lambda x, y: 77 if x > 500 else 5, _z_order=lambda: list(self.z),
+                            _shown=lambda h: True, _ex_style=lambda h: 0,
+                            _title=lambda h: {5: "笔记 - 记事本", 77: "voice-claude"}.get(h, "")).start()
         mock.patch.object(desktop, "_post", lambda payload, path="ask": (self.posts.append(payload), {"ok": True})[1]).start()
         self.typed = mock.patch.object(desktop, "_send_unicode").start()
         self.gui = mock.patch.multiple(desktop.pyautogui, press=mock.DEFAULT, hotkey=mock.DEFAULT, click=mock.DEFAULT,
@@ -520,6 +692,53 @@ class FrontendGuardTests(unittest.TestCase):
         self.typed.assert_not_called()
         self.gui["press"].assert_not_called()
         self.gui["click"].assert_not_called()
+
+    def test_with_it_in_front_typing_and_keys_go_to_the_window_behind_it(self):
+        """The user spoke to it, so it is in front: the window they were in is meant. The request names that window,
+        and it is brought back in front before anything is typed; when it cannot be, nothing is typed."""
+        self.fg[0], self.z = 77, [77, 5]
+
+        def back(h):
+            self.fg[0] = h
+            return True
+        with mock.patch.object(desktop, "_activate", back):
+            self.assertEqual(desktop.type_text("hello"), "已输入 5 个字。")
+            self.assertEqual(self.posts[-1]["question"], "我想在“记事本（笔记）”里输入文字：hello，可以吗？")
+            self.fg[0] = 77  # the user answered the next card
+            self.assertIn("已按 enter", desktop.press_keys("enter"))
+            self.assertIn("“记事本（笔记）”", self.posts[-1]["question"])
+        self.assertEqual([c.args[0] for c in self.typed.call_args_list], ["hello"])
+        self.gui["press"].assert_called_once_with("enter")
+        self.fg[0] = 77
+        out = desktop.type_text("hi")  # it cannot be brought back (a unit test never moves the real desktop)
+        self.assertTrue(out.startswith("没有做"), out)
+        self.assertEqual(len(self.typed.call_args_list), 1)
+
+    def test_an_always_on_top_window_behind_it_is_not_taken_for_the_users(self):
+        self.z = [77, 6, 5]
+        with mock.patch.multiple(desktop, _ex_style=lambda h: 0x8 if h == 6 else 0,
+                                 _title=lambda h: {5: "笔记 - 记事本", 6: "悬浮窗", 77: "voice-claude"}.get(h, "")):
+            self.assertEqual(desktop.window_behind_ours().hwnd, 5)
+            self.z = [77, 6]
+            self.assertEqual(desktop.window_behind_ours().hwnd, 6)  # nothing else: the request names it all the same
+        self.z = [77]
+        self.assertIsNone(desktop.window_behind_ours())
+
+    def test_after_a_click_typing_goes_to_the_window_clicked(self):
+        """In a run, the click brings its window forward: what follows is typed there, not refused because the
+        voice-claude window was in front when the run was asked."""
+        self.fg[0] = 77
+        self.gui["click"].side_effect = lambda *a, **k: self.fg.__setitem__(0, 5)
+        out = desktop.run_steps([{"tool": "click", "args": {"x": 100, "y": 10, "target": "输入框"}},
+                                 {"tool": "type_text", "args": {"text": "hello"}}])
+        self.assertNotIn("没有做", out)
+        self.assertIn("“记事本（笔记）”", self.posts[-1]["question"])
+        self.assertEqual([c.args[0] for c in self.typed.call_args_list], ["hello"])
+        # an open step's window stays the target of what follows a click
+        with mock.patch.object(desktop, "_post", lambda payload, path="ask": (self.posts.append(payload), {"ok": False})[1]):
+            desktop.run_steps([{"tool": "press_keys", "args": {"keys": "win+r"}}, {"tool": "click", "args": {"x": 100, "y": 10, "target": "框"}},
+                               {"tool": "type_text", "args": {"text": "notepad"}}])
+        self.assertIn("在“弹出的窗口”里输入文字", self.posts[-1]["question"])
 
     def test_focus_moving_to_it_after_the_request_stops_the_step(self):
         plan = desktop.plan_type("hello")  # asked while Notepad was in front
@@ -747,13 +966,14 @@ class OpenPathTests(unittest.TestCase):
         self.assertEqual(desktop.join_steps(["打开记事本", "在“W”里输入文字：hello", "在“W”里按回车"]),
                          "打开记事本，然后在“W”里输入文字：hello，然后按回车")
         plan = desktop.plan_press("Ctrl+D")
-        self.assertEqual(plan.facts, {"kind": "hotkey", "keys": ["ctrl", "d"], "window": "figures"})
-        self.assertEqual(desktop.plan_type("rm x").facts, {"kind": "type", "text": "rm x", "window": "figures"})
-        self.assertEqual(desktop.plan_click(1, 2, "删除").facts, {"kind": "click", "target": "删除", "window": "figures"})
+        self.assertEqual(plan.facts, {"kind": "hotkey", "keys": ["ctrl", "d"], "window": "figures", "program": "", "session": False})
+        self.assertEqual(desktop.plan_type("rm x").facts, {"kind": "type", "text": "rm x", "window": "figures", "program": "", "session": False})
+        with mock.patch.object(desktop, "_window_at", lambda x, y: 5):  # the click lands in the window in front
+            self.assertEqual(desktop.plan_click(1, 2, "删除").facts, {"kind": "click", "target": "删除", "window": "figures", "program": "", "session": False})
         posts = []
         with mock.patch.object(desktop, "_post", lambda payload: (posts.append(payload), {"ok": False, "message": "用户没有同意"})[1]):
             desktop.press_keys("Delete")
-        self.assertEqual(posts[0]["facts"], {"kind": "hotkey", "keys": ["delete"], "window": "figures"})
+        self.assertEqual(posts[0]["facts"], {"kind": "hotkey", "keys": ["delete"], "window": "figures", "program": "", "session": False})
 
     def test_typed_paths_are_spoken_by_their_last_name(self):
         long = r"C:\Users\you\OneDrive\Documents\report\figures"

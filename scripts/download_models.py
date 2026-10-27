@@ -1,10 +1,11 @@
-"""Download the speech models (about 640 MB) into models/.
+"""Download the speech models (about 640 MB) into models/, and the optional wake-word model (31 MB download, 8 MB kept).
 
 Sources: the sherpa-onnx GitHub releases (archives), or the same files on Hugging Face, directly or through the
 hf-mirror.com mirror that is fast in mainland China. The Hugging Face copies of the two big models were compared
 file by file with the GitHub archives (2026-10-23: same 10 + 377 files, same sizes). The small Silero VAD file
 (630 KB) only exists in this exact version on GitHub; when GitHub cannot be reached, an older Silero VAD from
-Hugging Face is used instead (sherpa-onnx reads both).
+Hugging Face is used instead (sherpa-onnx reads both). The wake-word model is only on GitHub (the Hugging Face copy
+is a WebAssembly package); when GitHub cannot be reached it is skipped and everything else still installs.
 
     .venv\\Scripts\\python scripts\\download_models.py [--source auto|github|hf|hf-mirror] [--yes] [--dest DIR]
 """
@@ -27,6 +28,10 @@ HOSTS = {"hf": "https://huggingface.co", "hf-mirror": "https://hf-mirror.com"}
 ASR = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
 TTS = "kokoro-multi-lang-v1_1"
 VAD = "silero_vad.onnx"
+KWS = "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"  # the wake word (standby); optional
+KWS_ARCHIVE = "kws-models/" + KWS + ".tar.bz2"
+KWS_FILES = ("encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx", "decoder-epoch-13-avg-2-chunk-16-left-64.onnx",
+             "joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx", "tokens.txt", "en.phone")  # what voiceclaude/wake.py loads
 # target in models/ -> (GitHub release path, Hugging Face repo, files to skip there)
 MODEL_SOURCES = {
     ASR: ("asr-models/" + ASR + ".tar.bz2", "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
@@ -43,6 +48,8 @@ LICENSES = [
     ("Silero VAD（判断说完了）", "MIT", "https://github.com/snakers4/silero-vad/blob/master/LICENSE"),
     ("Kokoro-82M 多语言 v1.1（朗读，hexgrad；含 espeak-ng 数据和 cppjieba 词典）", "Apache-2.0（espeak-ng-data 为 GPL-3.0，cppjieba 词典为 MIT）",
      "https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh"),
+    ("sherpa-onnx 唤醒词模型 kws-zipformer-zh-en-3M（k2-fsa，可选）", "Apache-2.0",
+     "https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html"),
 ]
 
 
@@ -184,6 +191,28 @@ def from_hf(target: str, dest_root: Path, host: str) -> None:
     tmpdir.replace(dest_root / target)
 
 
+def kws_from_github(dest_root: Path) -> None:
+    """The wake-word model: only the five files wake.py loads are kept (the archive also has float32 copies, a
+    lower-latency variant and test recordings)."""
+    print("  唤醒词")
+    tmp = dest_root / Path(KWS_ARCHIVE).name
+    fetch(f"{GITHUB}/{KWS_ARCHIVE}", tmp)
+    part = dest_root / (KWS + ".extract")
+    shutil.rmtree(part, ignore_errors=True)
+    part.mkdir(parents=True)
+    try:
+        with tarfile.open(tmp, "r:bz2") as tar:
+            safe_extract(tar, part)
+        keep = part / KWS / "keep"
+        keep.mkdir()
+        for name in KWS_FILES:
+            (part / KWS / name).replace(keep / name)
+        keep.replace(dest_root / KWS)
+    finally:
+        shutil.rmtree(part, ignore_errors=True)
+        tmp.unlink(missing_ok=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="下载语音模型（约 640 MB）")
     ap.add_argument("--source", choices=["auto", "github", "hf", "hf-mirror"], default="auto")
@@ -194,7 +223,8 @@ def main(argv: list[str] | None = None) -> int:
     dest_root = Path(a.dest)
     dest_root.mkdir(parents=True, exist_ok=True)
     todo = [t for t in MODEL_SOURCES if not (dest_root / t).exists() and (a.only is None or t in a.only)]
-    if not todo:
+    wake = not (dest_root / KWS).exists() and (a.only is None or KWS in a.only)
+    if not todo and not wake:
         print("  已有，跳过。")
         return 0
     if not a.yes:  # run by hand: the licenses once (install.bat passes --yes; they are in NOTICE.md)
@@ -218,6 +248,11 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as e:
             print(f"没下载成功：{target}\n  原因：{e}\n  网络好一点时再运行一次就行，已下好的不会重下。")
             return 1
+    if wake:
+        try:
+            kws_from_github(dest_root)
+        except (OSError, tarfile.TarError) as e:  # optional: everything else works without it
+            print(f"  唤醒词模型没下载（只有 GitHub 上有）：{e}\n  能连上 GitHub 时再运行一次就行。")
     print("  完成")
     return 0
 

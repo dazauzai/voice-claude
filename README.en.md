@@ -65,6 +65,14 @@ In continuous conversation with headphones on, just start talking to make it sto
 
 When you can't talk, type in the box at the bottom of the window and press Enter (Shift+Enter for a new line). It works the same as speaking.
 
+To call it without a key: double-click `standby.bat` to enter standby, then say "hi chat" and the window opens and listens (the wake word can be changed; the settings page can make standby start at login).
+
+Each reply shows the tokens that turn used; the settings page's 用量 group has today's totals and, with a Claude subscription, the quota left (say "用量怎么样" to hear it).
+
+To look at a picture or a structure, say "打开白板" (open the whiteboard): each project has its own board (Excalidraw; mouse, touch and pen all draw). It puts cards and pictures there; after you draw or write something, press **让它看** (let it look) and it sees the board.
+
+Each project keeps a record: when a topic wraps up, it notes what was done, why and how it turned out in `~/.voice-claude/records/`, and reads the latest entries when the project is opened again (settings → 记录 → 打开).
+
 To take something back, say "撤回上一句" (undo the last sentence; say it again to go further back), or right-click one of your sentences in the window and choose **从这里重来** (start over from here). The conversation goes back to just before it, and the sentence lands in the box for you to edit and send again. If the turns you undo changed files, it asks whether to change them back too.
 
 A few things to say:

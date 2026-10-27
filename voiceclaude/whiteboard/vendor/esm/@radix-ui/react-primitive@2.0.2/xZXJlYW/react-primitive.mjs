@@ -1,0 +1,3 @@
+/* esm.sh - @radix-ui/react-primitive@2.0.2 */
+import*as o from"react";import*as e from"react-dom";import{Slot as p}from"../../react-slot@1.1.2/xZXJlYW/react-slot.mjs";import{jsx as c}from"react/jsx-runtime";var u=["a","button","div","form","h2","h3","img","input","label","li","nav","ol","p","span","svg","ul"],d=u.reduce((t,i)=>{let r=o.forwardRef((a,m)=>{let{asChild:n,...s}=a,f=n?p:i;return typeof window<"u"&&(window[Symbol.for("radix-ui")]=!0),c(f,{...s,ref:m})});return r.displayName=`Primitive.${i}`,{...t,[i]:r}},{});function h(t,i){t&&e.flushSync(()=>t.dispatchEvent(i))}var R=d;export{d as Primitive,R as Root,h as dispatchDiscreteCustomEvent};
+//# sourceMappingURL=react-primitive.mjs.map

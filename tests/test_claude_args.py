@@ -283,6 +283,119 @@ class ArgsTests(unittest.TestCase):
         self.assertIn(("rewind_failed", {}), events)
         self.assertNotIn("exit", [k for k, d in events])
 
+    @staticmethod
+    def _mu(**models):
+        """modelUsage as Claude Code sends it: running totals per model."""
+        out = {}
+        for name, (inp, outp, cr, cw, cost, canonical) in models.items():
+            out[name] = {"inputTokens": inp, "outputTokens": outp, "cacheReadInputTokens": cr, "cacheCreationInputTokens": cw,
+                         "webSearchRequests": 0, "costUSD": cost, "costBasis": "list", "canonicalModel": canonical}
+        return out
+
+    def test_usage_per_turn_and_rate_limits(self):
+        """'tokens' = result.usage (the turn's main loop); 'all_tokens' and the cost = the change in modelUsage over every
+        model (a subagent on another model counts too); a conversation reset starts the totals again."""
+        events = []
+        s = ClaudeSession(config.Config(), "P", lambda k, d: events.append((k, d)), line_id="l1")
+        s._handle({"type": "result", "usage": {"input_tokens": 3, "output_tokens": 324, "cache_read_input_tokens": 15000,
+                                               "cache_creation_input_tokens": 2000},
+                   "modelUsage": self._mu(**{"claude-opus-5-5": (3, 324, 15000, 2000, 0.0123, "claude-opus-5-5")}),
+                   "total_cost_usd": 0.0123})
+        # turn 2: the main loop on Opus, plus a subagent on Haiku that result.usage leaves out
+        s._handle({"type": "result", "usage": {"input_tokens": 5, "output_tokens": 65},
+                   "modelUsage": self._mu(**{"claude-opus-5-5": (8, 389, 15000, 2000, 0.0150, "claude-opus-5-5"),
+                                             "claude-haiku-4-5-20251001": (900, 120, 0, 0, 0.0010, "claude-haiku-4-5")}),
+                   "total_cost_usd": 0.0160})
+        u = [d for k, d in events if k == "usage"]
+        self.assertEqual((u[0]["model"], u[0]["tokens"], u[0]["cost_usd"], u[0]["cost_basis"]),
+                         ("claude-opus-5-5", {"input": 3, "output": 324, "cache_read": 15000, "cache_write": 2000}, 0.0123, "list"))
+        self.assertEqual(u[1]["tokens"], {"input": 5, "output": 65, "cache_read": 0, "cache_write": 0})  # the line under the reply
+        self.assertEqual(u[1]["all_tokens"], {"input": 905, "output": 185, "cache_read": 0, "cache_write": 0, "web_search": 0})
+        self.assertEqual(u[1]["cost_usd"], 0.0037)  # Opus 0.0027 + the Haiku subagent 0.0010
+        self.assertEqual(sorted(m["model"] for m in u[1]["by_model"]), ["claude-haiku-4-5", "claude-opus-5-5"])
+        s._handle({"type": "conversation_reset"})
+        s._handle({"type": "result", "usage": {"input_tokens": 1, "output_tokens": 2},
+                   "modelUsage": self._mu(**{"claude-opus-5-5": (1, 2, 0, 0, 0.0004, "claude-opus-5-5")}), "total_cost_usd": 0.0004})
+        self.assertEqual([d for k, d in events if k == "usage"][-1]["cost_usd"], 0.0004)  # counted from 0 again
+        info = {"status": "allowed", "rateLimitType": "five_hour", "unifiedWindows": {"five_hour": {"utilization": 0.08}}}
+        s._handle({"type": "rate_limit_event", "rate_limit_info": info})
+        self.assertIn(("limits", info), events)
+
+    def test_a_resumed_sessions_restored_spend_is_not_counted_again(self):
+        """Since Claude Code 2.1.277 the totals of a resumed session carry its earlier spend. With the session's saved
+        totals the first turn is the change from them; without them, only that turn's own tokens and no cost."""
+        saved = {"S1": {"models": {"claude-opus-5-5": {"input": 500, "output": 9000, "cache_read": 300000, "cache_write": 20000,
+                                                       "web_search": 1, "cost": 4.20}}, "cost": 4.20}}
+        events = []
+        s = ClaudeSession(config.Config(), "P", lambda k, d: events.append((k, d)), line_id="l1", resume="S1")
+        s.baseline_lookup = saved.get
+        with mock.patch.object(s, "build_args", lambda: []), mock.patch("subprocess.Popen"), \
+                mock.patch("voiceclaude.claude.testing.under_test_runner", lambda: False), mock.patch("threading.Thread"):
+            s.start()
+        restored = self._mu(**{"claude-opus-5-5": (510, 9100, 310000, 20000, 4.25, "claude-opus-5-5")})
+        restored["claude-opus-5-5"]["webSearchRequests"] = 1
+        s._handle({"type": "result", "usage": {"input_tokens": 10, "output_tokens": 100, "cache_read_input_tokens": 10000},
+                   "modelUsage": restored, "total_cost_usd": 4.25})
+        u = [d for k, d in events if k == "usage"][-1]
+        self.assertEqual((u["all_tokens"]["output"], u["cost_usd"]), (100, 0.05))  # not the session's whole 4.25
+        self.assertEqual((u["session"], u["baseline"]["cost"]), (s.session_id, 4.25))  # saved again for next time
+        events.clear()
+        s2 = ClaudeSession(config.Config(), "P", lambda k, d: events.append((k, d)), line_id="l2", resume="S-unknown")
+        s2.baseline_lookup = saved.get
+        with mock.patch.object(s2, "build_args", lambda: []), mock.patch("subprocess.Popen"), \
+                mock.patch("voiceclaude.claude.testing.under_test_runner", lambda: False), mock.patch("threading.Thread"):
+            s2.start()
+        s2._handle({"type": "result", "usage": {"input_tokens": 10, "output_tokens": 100}, "modelUsage": restored,
+                    "total_cost_usd": 4.25})
+        u = [d for k, d in events if k == "usage"][-1]
+        self.assertEqual((u["all_tokens"]["output"], u["cost_usd"]), (100, None))  # only its own tokens, cost not known
+        more = self._mu(**{"claude-opus-5-5": (515, 9150, 310000, 20000, 4.27, "claude-opus-5-5")})
+        more["claude-opus-5-5"]["webSearchRequests"] = 1
+        s2._handle({"type": "result", "usage": {"input_tokens": 5, "output_tokens": 50}, "modelUsage": more, "total_cost_usd": 4.27})
+        u = [d for k, d in events if k == "usage"][-1]
+        self.assertEqual((u["all_tokens"]["output"], u["cost_usd"]), (50, 0.02))  # from the first result on, the change
+        s.fork_at = ("u-3", None)  # a rewind restores only part of the spend: its first turn has no known cost
+        with mock.patch.object(s, "build_args", lambda: []), mock.patch("subprocess.Popen"), \
+                mock.patch("voiceclaude.claude.testing.under_test_runner", lambda: False), mock.patch("threading.Thread"):
+            s.start()
+        s._handle({"type": "result", "usage": {"input_tokens": 7, "output_tokens": 70}, "modelUsage": more, "total_cost_usd": 4.27})
+        u = [d for k, d in events if k == "usage"][-1]
+        self.assertEqual((u["all_tokens"]["output"], u["cost_usd"]), (70, None))
+
+    def test_a_long_tool_call_being_written_is_shown(self):
+        """A 2000-character type_text takes the model a minute to write, with nothing to show: 'writing' after 3 s,
+        every 2 s after that, done when the call is complete. A quick call says nothing."""
+        events, clock = [], [100.0]
+        s = ClaudeSession(config.Config(), "P", lambda k, d: events.append((k, d)), line_id="l1")
+
+        def ev(e):
+            s._handle({"type": "stream_event", "event": e})
+
+        def delta(text, at):
+            clock[0] = at
+            ev({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": text}})
+
+        with mock.patch("voiceclaude.claude.time.monotonic", lambda: clock[0]):
+            ev({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "name": "mcp__desktop__click"}})
+            clock[0] = 101.0
+            ev({"type": "content_block_stop", "index": 0})
+            ev({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "name": "mcp__desktop__type_text"}})
+            for i, at in enumerate((101.0, 102.0, 103.5, 104.0, 105.0, 105.6, 106.0, 108.0)):
+                delta("x" * 10, at)
+            clock[0] = 109.0
+            ev({"type": "content_block_stop", "index": 1})
+        w = [d for k, d in events if k == "writing"]
+        self.assertEqual([(d["tool"], d["chars"], d["seconds"], d["done"]) for d in w],
+                         [("mcp__desktop__type_text", 40, 3, False), ("mcp__desktop__type_text", 70, 5, False),
+                          ("mcp__desktop__type_text", 80, 7, False), ("mcp__desktop__type_text", 80, 8, True)])
+        events.clear()
+        with mock.patch("voiceclaude.claude.time.monotonic", lambda: clock[0]):  # cut off by the end of the turn
+            ev({"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "name": "mcp__desktop__type_text"}})
+            delta("y", 115.0)
+            s._handle({"type": "result", "subtype": "error_during_execution", "is_error": True})
+        self.assertEqual([d["done"] for k, d in events if k == "writing"], [False, True])
+        self.assertTrue(any(k == "text" for k, d in events) is False)  # nothing of it is read out
+
     def test_desktop_disabled_drops_server(self):
         cfg = config.Config()
         cfg.desktop_enabled = False

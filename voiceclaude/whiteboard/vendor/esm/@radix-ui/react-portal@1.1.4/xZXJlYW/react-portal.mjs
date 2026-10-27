@@ -1,0 +1,3 @@
+/* esm.sh - @radix-ui/react-portal@1.1.4 */
+"use client";import*as t from"react";import s from"react-dom";import{Primitive as f}from"../../react-primitive@2.0.2/xZXJlYW/react-primitive.mjs";import{useLayoutEffect as l}from"../../react-use-layout-effect@1.1.0/xZXJlYW/react-use-layout-effect.mjs";import{jsx as p}from"react/jsx-runtime";var u="Portal",r=t.forwardRef((e,a)=>{let{container:i,...n}=e,[c,m]=t.useState(!1);l(()=>m(!0),[]);let o=i||c&&globalThis?.document?.body;return o?s.createPortal(p(f.div,{...n,ref:a}),o):null});r.displayName=u;var y=r;export{r as Portal,y as Root};
+//# sourceMappingURL=react-portal.mjs.map

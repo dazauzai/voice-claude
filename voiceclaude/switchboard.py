@@ -13,10 +13,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import access as accessmod, gateway, managers, paths, projects, prompts, risk
-from .claude import DESKTOP_SERVER, MANAGER_SERVER, SETTINGS_SERVER, ClaudeSession, server_spec
+from . import access as accessmod, board, gateway, managers, paths, projects, prompts, records, relay, risk, usage
+from .claude import DESKTOP_SERVER, MANAGER_SERVER, PERMISSION_MODE, SETTINGS_SERVER, ClaudeSession, server_spec
 from .engine_codex import CodexSession
-from .config import PERMISSION_LABELS, PERMISSION_VALUES, Config, normalize_permission_value, save as config_save
+from .config import ALWAYS_ASK, PERMISSION_LABELS, PERMISSION_VALUES, Config, normalize_permission_value, save as config_save
 from .jobs import Job, Jobs, looks_endless
 from .line import CLOSED, DEAD, IDLE, STARTING, WAITING, WORKING, Line, file_hash
 from .projects import Project
@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 
 MANAGER, SCRATCH = "manager", "scratch"
 DESKTOP_ACTIONS = {"screenshot", "click", "type", "hotkey", "scroll", "open_app"}
+POLICY_RANK = {"allow": 0, "ask": 1, "deny": 2}
 # Spoken name -> what Claude Code is given. Fable is slow and expensive, so its approval question says so.
 MODELS = dict(accessmod.CLAUDE_MODELS)  # one source; [providers.claude] models may override the ids
 MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet", "fable": "fable", "fable5": "fable", "fable5.1": "fable",
@@ -51,7 +52,7 @@ def normalize_model(text: str) -> str | None:
 FRONTEND_PATHS = {"get_settings", "list_devices", "set_font_size", "set_microphone", "set_speaker",
                   "list_voices", "set_voice", "set_speed"}
 PHRASES = {"back_to_manager", "scratch", "background_mode", "background_status", "shutdown_daemon", "transparent_on", "transparent_off",
-           "rewind_last"}
+           "rewind_last", "usage_status"}
 TRANSPARENT_QUESTION = "开启通透模式：除删除和覆盖已有文件外，所有操作直接执行，不再询问。设为禁止的仍然禁止。可以吗？"
 TRANSPARENT_PASSED = "通透模式：直接执行。"  # what the model hears: nobody was asked, so never "用户同意了"
 
@@ -100,6 +101,13 @@ class Switchboard:
         self.frontend_pid = 0  # the window's process: the desktop tools never type into it
         self.forgotten: set[str] = set()  # projects whose saved conversation was dropped in this run
         self.lines_lock = threading.Lock()  # every read-modify-write of lines.json, from any thread
+        self.usage = usage.Ledger(paths.USAGE_FILE)  # tokens per day and provider; the latest quota snapshots
+        self.boards = board.Boards(paths.BOARDS_DIR)  # the shared whiteboard, one per project (board.py)
+        self.boards.on_user_snapshot = self.board_shown_by_user
+        self.last_usage: dict[str, dict] = {}  # line -> its latest "usage" event
+        self.relays: dict[str, dict] = {}  # tool_use_id -> a message to another session, approved, not yet sent
+        self.relay_watch = lambda target, path, offset, message, on_state, **kw: \
+            relay.Watch(target, path, offset, message, on_state=on_state, **kw).run()
         self.max_lines = int(getattr(cfg, "max_lines", 3))
         self.idle_seconds = float(getattr(cfg, "idle_minutes", 10)) * 60
         # VOICECLAUDE_START_WITH lets a self-test pick its own project without touching config.toml
@@ -437,7 +445,7 @@ class Switchboard:
             model = str(getattr(self.cfg, "manager_model", "sonnet") or "sonnet") if line.provider == "claude" else None
             effort = str(getattr(self.cfg, "manager_effort", "low") or "")
         else:
-            prompt = prompts.SCRATCH_PROMPT if line.kind == SCRATCH else prompts.PROJECT_PROMPT
+            prompt = self._line_prompt(line)
             servers = {SETTINGS_SERVER: server_spec("mcp_server.py")}
             if self.cfg.desktop_enabled:
                 servers[DESKTOP_SERVER] = server_spec("desktop.py")
@@ -447,7 +455,7 @@ class Switchboard:
             # The user's own Codex (ChatGPT plan) is the engine for this line; its approvals come through our gate.
             line.engine = "codex"
             (paths.LINES_DIR / line.id).mkdir(parents=True, exist_ok=True)
-            s = CodexSession(self.cfg, prompt, line.on_session, cwd=line.cwd, line_id=line.id, resume=resume,
+            s = CodexSession(self.cfg, prompts.for_codex(prompt), line.on_session, cwd=line.cwd, line_id=line.id, resume=resume,
                              model=model if line.provider != "claude" else None, effort=effort, servers=servers,
                              ask=lambda action, question, detail, facts=None, _id=line.id: self.gate(_id, action, question, detail, facts),
                              exe=st.claude or None, stderr_path=paths.LINES_DIR / line.id / "codex-stderr.log")
@@ -460,6 +468,8 @@ class Switchboard:
         self._ensure_gateway(line.provider)  # raises when the translation layer cannot serve this provider
         s = ClaudeSession(self.cfg, prompt, line.on_session, cwd=line.cwd, line_id=line.id, resume=resume,
                           model=model, effort=effort, servers=servers, provider=line.provider)
+        s.baseline_lookup = self.usage.baseline  # a resumed session's spend so far is not counted again
+        s.tool_gate = lambda tool, data, tool_use_id, _id=line.id: self.gate_tool(_id, tool, data, tool_use_id)
         if resume and getattr(line, "resume_fork", None):
             s.fork_at = tuple(line.resume_fork)  # the rewind made before the line was closed, still to be made real
         s.port = self.control_port
@@ -558,11 +568,169 @@ class Switchboard:
             return self.GREETING
         return f"现在接着{line.name}。" + (line.summary_for_return() or "")
 
+    # ---------- records (records.py): written by the line's tool, asked for when a topic ends ----------
+
+    RECORD_NUDGE = ("（这是 voice-claude 的提示，不是用户说的话）刚才那个话题如果已经告一段落、还没记，就用 record 工具记一条；"
+                    "已经记过、或者没什么值得记的，就什么都不用做。不用回答，也不要说话。")
+    SHUTDOWN_RECORD_WAIT = 30.0
+
+    def _line_prompt(self, line: Line) -> str:
+        """A line's system prompt; a project line's carries its latest records and where the rest are."""
+        if line.kind == SCRATCH:
+            return prompts.SCRATCH_PROMPT
+        try:
+            return prompts.PROJECT_PROMPT + records.prompt_block(line.name, self._record_key(line))
+        except Exception:  # a records problem never stops a line
+            log.exception("[%s] could not read the records", line.id)
+            return prompts.PROJECT_PROMPT
+
+    @staticmethod
+    def _record_key(line: Line) -> str:
+        """The project's records file goes by this as well as its name: the name can change (a second Atlas, a
+        renamed folder), this cannot (the line id is a hash of the project's key)."""
+        return line.id.removeprefix("p-")
+
+    def _fresh_prompt(self, line: Line) -> None:
+        """Before a restart (a model or provider switch, a reconnect): the records as they are now."""
+        if line.kind in ("project", SCRATCH) and line.session is not None and hasattr(line.session, "system_prompt"):
+            p = self._line_prompt(line)
+            line.session.system_prompt = prompts.for_codex(p) if line.engine == "codex" else p
+
+    def _nudge_record(self, line: Line | None) -> bool:
+        """At a topic's end (the user moves to another line, the line is closed for idleness, its model is switched,
+        the service stops): one quiet nudge to write a record, if the user has had more than one turn since the last
+        one. True when sent."""
+        if line is None or line.kind != "project" or line.turns_since_record < 2 or line.record_asked \
+                or line.state != IDLE or line.session is None:
+            return False
+        line.record_asked = True
+        try:
+            sent = line.nudge(self.RECORD_NUDGE)
+        except Exception:
+            log.exception("[%s] record nudge failed", line.id)
+            return False
+        if sent:
+            log.info("[%s] asked to record the topic (%d turns since the last record)", line.id, line.turns_since_record)
+        return sent
+
+    def record_topic(self, line_id: str, data: dict) -> dict:
+        line = self.lines.get(line_id)
+        if line is None or line.kind != "project":
+            return {"ok": False, "message": "这条线不记记录（只有项目线记，总机和杂项不记）。"}
+        try:
+            n, path = records.append(line.name, str(data.get("what") or ""), str(data.get("why") or ""),
+                                     str(data.get("how") or ""), str(data.get("result") or ""), str(data.get("title") or ""),
+                                     key=self._record_key(line))
+        except (ValueError, OSError) as e:
+            return {"ok": False, "message": str(e)}
+        line.turns_since_record, line.record_asked = 0, False
+        log.info("[%s] record %d written", line.id, n)
+        return {"ok": True, "message": f"记好了：{line.name}的第 {n} 条。"}
+
+    # ---------- the shared whiteboard (board.py): the line's tools ----------
+
+    BOARD_CLOSED = "白板没开：请用户说“打开白板”。"
+
+    def _board_elsewhere(self, key: str) -> str:
+        """'' unless a window shows another project's board (it was opened while another line was in front): what
+        to tell the user then. Every project has its own board."""
+        names = []
+        for k in self.boards.open_keys():
+            if k == key:
+                return ""
+            line = self.lines.get("p-" + k)
+            names.append(line.name if line else (self.boards.scene(k)[2] or "另一个项目"))
+        if not names:
+            return ""
+        shown = "、".join(f"「{n}」" for n in names)
+        return f"开着的白板窗口是{shown}的白板，不是这个项目的（每个项目的白板是分开的）。请用户在这里说“打开白板”，打开这个项目的。"
+
+    @staticmethod
+    def board_message(snap: dict) -> str:
+        texts = snap.get("texts") or []
+        listed = "".join(f"\n{i}. {t}" for i, t in enumerate(texts, 1)) or "\n（白板上没有文字）"
+        return (f"白板截图在 {snap['png']}（用 Read 打开看图；文字另存在 {snap['txt']}）。"
+                f"白板上的文字，按位置从上到下，原文：{listed}")
+
+    def board_shown_by_user(self, key: str, snap: dict) -> None:
+        """The user pressed 让它看 in the board window: the board's own project line gets it as the user's words (it
+        is put in front first, so its answer is heard). No question: the user asked for it."""
+        line_id = "p-" + key
+        line = self.lines.get(line_id)
+        if line is None or line.state in (DEAD, CLOSED):
+            p = next((p for p in self.index if "p-" + hashlib.sha1(p.key.encode("utf-8")).hexdigest()[:8] == line_id), None)
+            if p is None:
+                self.emit("notice", {"text": "这块白板的项目找不到了，白板没有交出去。"})
+                return
+            try:
+                line = self.line_for_project(p)
+            except Exception as e:
+                log.exception("board %s: could not open its project", key)
+                self.emit("notice", {"text": f"白板没有交出去：{e}"})
+                return
+        if self.active_id != line.id:
+            self.switch(line.id, announce=f"接到{line.name}，把白板给它看。")
+        r = self.say(line.id, "（用户在白板窗口里按了“让它看”）" + self.board_message(snap) + "\n请根据用户画的、写的、贴的来回答。")
+        if not r.get("ok", True):
+            self.emit("notice", {"text": f"白板没有交给{line.name}：{r.get('message', '')}"})
+
+    def board_tool(self, line_id: str, tool: str, data: dict) -> dict:
+        line = self.lines.get(line_id)
+        if line is None or line.kind != "project":
+            return {"ok": False, "message": "白板只在项目线上用（总机和杂项没有白板）。"}
+        key, name = self._record_key(line), line.name
+        if tool == "board_show":
+            kind = str(data.get("kind") or "text").strip().lower()
+            title, near = str(data.get("title") or ""), str(data.get("near_id") or "")
+            try:
+                if kind == "text":
+                    text = str(data.get("content") or "").strip()
+                    if not text:
+                        return {"ok": False, "message": "没有要放的文字（content）。"}
+                    elements, files = board.card(text, title, 0, 0), {}
+                elif kind == "image":
+                    elements, files = board.image(str(data.get("path") or data.get("content") or ""), title, 0, 0)
+                elif kind == "shape":
+                    elements = board.shape(str(data.get("shape") or "rectangle").strip().lower(),
+                                           str(data.get("content") or title or ""), 0, 0)
+                    files = {}
+                else:
+                    return {"ok": False, "message": "kind 只能是 text、image 或 shape。"}
+            except (OSError, ValueError) as e:
+                return {"ok": False, "message": f"没放上白板：{e}"}
+            x0 = min(e["x"] for e in elements)
+            y0 = min(e["y"] for e in elements)
+            w = max(e["x"] + e["width"] for e in elements) - x0
+            h = max(e["y"] + e["height"] for e in elements) - y0
+            x, y = self.boards.place(key, w, h, near)
+            for e in elements:
+                e["x"], e["y"] = round(e["x"] - x0 + x), round(e["y"] - y0 + y)
+            ids = self.boards.add(key, elements, files, name)
+            seen = "" if self.boards.is_open(key) else (self._board_elsewhere(key) or "白板现在没开，用户说“打开白板”就能看到。")
+            return {"ok": True, "message": f"放上白板了（id：{ids[0]}，要挨着它放下一张就把它当 near_id）。{seen}", "ids": ids}
+        if tool == "board_look":
+            snap = self.boards.snapshot(key)
+            scene, _, _ = self.boards.scene(key, name)
+            if snap is None:
+                texts = board.texts_of(scene)
+                self.emit("board", {"line": line_id, "want": "look"})  # the window may offer to open it
+                listed = "".join(f"\n{i}. {t}" for i, t in enumerate(texts, 1))
+                closed = (self._board_elsewhere(key) or self.BOARD_CLOSED) if not self.boards.is_open(key) else \
+                    "白板开着，但页面这次没有交回截图（可能正忙），等一下再看一次。"
+                return {"ok": False, "message": closed + (f"白板上现在的文字（按位置从上到下）：{listed}" if texts else "")}
+            return {"ok": True, "message": self.board_message({**snap, "texts": snap.get("texts") or board.texts_of(scene)})}
+        ok, why = self.gate(line_id, "board_clear", "我想把白板清空（上面的东西都删掉，会留一份备份），可以吗？")
+        if not ok:
+            return {"ok": False, "message": why}
+        backup = self.boards.clear(key)
+        return {"ok": True, "message": "白板清空了。" + (f"原来的内容备份在 {backup}。" if backup else "")}
+
     def switch(self, line_id: str, announce: str | None = None) -> dict:
         with self.lock:
             line = self.lines.get(line_id)
             if line is None or line.state in (DEAD, CLOSED):
                 return {"ok": False, "message": "那条线不在了"}
+            left = self.lines.get(self.active_id) if self.active_id != line_id else None
             self.active_id = line_id
             line.last_used = self.now()
             for l in self.lines.values():
@@ -575,6 +743,7 @@ class Switchboard:
             self.emit("notice", {"text": announce})
         if summary:
             self.emit("notice", {"text": summary})
+        self._nudge_record(left)  # the user left that topic
         return {"ok": True, "message": announce or "", "line": line_id}
 
     def switch_to_project(self, text: str, confirm: bool = False) -> dict:
@@ -736,7 +905,8 @@ class Switchboard:
                 self._forget_session(line)
                 line.session_id, line.started_resume, line.base_point, line.log_from_start = "", "", None, True
             else:
-                line.session.rewind_to(keep, first, single=len(dropped) == 1)
+                # one sentence, unless the service's own quiet turn (a record nudge) came after it: then two turns go
+                line.session.rewind_to(keep, first, single=len(dropped) == 1 and not dropped[0].get("quiet_after"))
             line.pending_note = ""  # whatever a half-done rewind left for the model is about turns now gone
         except Exception as e:
             # the line is back on its conversation as it was; the turn record stays as it is
@@ -865,6 +1035,9 @@ class Switchboard:
         return {"ok": True, "spoken": "好，关掉后台服务。", "shutdown": True}
 
     def phrase(self, key: str) -> dict:
+        if key == "usage_status":
+            names = {p: accessmod.provider_for(p, self.cfg).name.split("（")[0] for p in accessmod.PROVIDER_ORDER}
+            return {"ok": True, "spoken": usage.summary(self.usage.today(), self.usage.limits(), names, time.time())}
         if key == "rewind_last":
             r = self.rewind(self.active_id or MANAGER, steps=1)
             return {"ok": r["ok"], "spoken": r["message"], "text": r.get("text", ""), "files_restored": r.get("files_restored", 0)}
@@ -944,6 +1117,11 @@ class Switchboard:
     def gate(self, line_id: str, action: str, question: str, detail: str = "", facts: dict | None = None) -> tuple[bool, str]:
         policy = self.cfg.permissions.get(action, "ask") if action else "ask"
         label = PERMISSION_LABELS.get(action, action)
+        reach = self._reaches_claude(action, question, detail, facts)
+        if reach:  # asked like a message to another session: its setting when stricter, its question in 通透模式 too
+            send = self.cfg.permissions.get("send_to_session", "ask")
+            if POLICY_RANK.get(send, 1) > POLICY_RANK.get(policy, 1):
+                policy, label = send, PERMISSION_LABELS["send_to_session"]
         if action in DESKTOP_ACTIONS and line_id != self.active_id:
             return False, "这条线不在前台，不能动桌面；等用户接回来再做。"
         if policy == "deny":
@@ -952,7 +1130,9 @@ class Switchboard:
         if policy == "allow":
             log.info("gate %s/%s: allowed by the permissions table", line_id, action)
             return True, ""
-        if getattr(self.cfg, "transparent", False):
+        if reach:
+            question = f"{reach[1]}：{question}"
+        elif getattr(self.cfg, "transparent", False) and action not in ALWAYS_ASK:
             kind, why = risk.classify(action, question, detail, facts)
             if kind is None:
                 log.info("gate %s/%s: transparent mode, passed", line_id, action)
@@ -964,6 +1144,18 @@ class Switchboard:
             return True, ""
         return False, "用户没有同意，没有执行。不要再试同一个动作，口头说一句就好。"
 
+    @staticmethod
+    def _reaches_claude(action: str, question: str, detail: str, facts: dict | None) -> tuple[str, str] | None:
+        """(kind, reason) when the step would start another Claude Code (no gate of ours: its messages to the user's
+        other sessions go unasked) or put words into a window where a Claude session runs; else None."""
+        if action in ("background_job", "codex_shell", "open_app"):
+            command = str((facts or {}).get("command") or (detail if action != "open_app" else ""))
+            return (risk.CLAUDE, risk.STARTS_CLAUDE_WHY) if command and risk.starts_claude(command) else None
+        if action in ("type", "hotkey", "click") and isinstance(facts, dict):
+            kind, why = risk.classify(action, question, detail, facts)
+            return (kind, why) if kind in (risk.CLAUDE, risk.SEND) else None
+        return None
+
     def gate_batch(self, line_id: str, question: str, actions: list[str], detail: str,
                    facts: list[dict] | None = None) -> dict:
         table = self.cfg.permissions
@@ -972,10 +1164,16 @@ class Switchboard:
         denied = [PERMISSION_LABELS.get(a, a) for a in actions if table.get(a, "ask") == "deny"]
         if denied:
             return {"ok": False, "message": f"这串步骤里有被用户禁止的动作（{'、'.join(denied)}），没有执行。"}
-        if actions and all(table.get(a, "ask") == "allow" for a in actions):
+        risky = risk.classify_steps(actions, facts, detail)
+        send = table.get("send_to_session", "ask")
+        reaches = any(k in (risk.CLAUDE, risk.SEND) for _, k, _ in risky)  # another Claude: asked like a message
+        if reaches and send == "deny":
+            return {"ok": False, "message": f"这串步骤里有被用户禁止的动作（{PERMISSION_LABELS['send_to_session']}），没有执行。"}
+        if reaches and send == "ask":
+            question = f"{risk.batch_reason(risky)}：{question}"
+        elif actions and all(table.get(a, "ask") == "allow" for a in actions):
             return {"ok": True, "message": "这些动作用户都设成了不用问，已放行。"}
-        if getattr(self.cfg, "transparent", False):
-            risky = risk.classify_steps(actions, facts, detail)
+        elif getattr(self.cfg, "transparent", False):
             if not risky:
                 log.info("gate %s/batch: transparent mode, passed", line_id)
                 return {"ok": True, "message": TRANSPARENT_PASSED}
@@ -984,6 +1182,133 @@ class Switchboard:
             return {"ok": False, "per_step": True, "message": "用户要求一步一步问。"}
         ok = self.ask_frontend(line_id, "batch", question, detail) is True
         return {"ok": ok, "message": "用户同意了。" if ok else "用户没有同意，没有执行。不要再试同一串动作，口头说一句就好。"}
+
+    # ---------- messages to the user's other Claude Code sessions ----------
+
+    SPOKEN_CHARS = 80  # how much of a message to another session is read out; all of it is shown
+    RELAY_RETRY = 1.0  # seconds before looking the target up a second time
+
+    # what the user hears when the answer does not simply come back (why -> words; {to} = the session's name)
+    RELAY_HELD = "「{to}」把这条消息扣住了：要你在那个会话里批准，它才收得到；不批准，过一阵就作废。"
+    RELAY_UNRECEIVED_YET = "「{to}」还没收到这句话，可能在桌面应用里等你批准。"
+    RELAY_NOT_LOCAL = "「{to}」不是这台电脑上开着的会话，它的回答这里读不到。"
+    RELAY_ENDED = {"unreceived": "「{to}」没有收到这句话。", "timeout": "「{to}」还没回答。",
+                   "working": "「{to}」还在做，回答稍后看它的对话。", "gone": "「{to}」的会话关掉了，没有回答。",
+                   "error": "读「{to}」的回答时出错了。", "": "「{to}」做完了，没有文字回答。"}
+    RELAY_PARTIAL = {"timeout": "「{to}」没有回答完。", "working": "「{to}」还在做，回答稍后看它的对话。",
+                     "gone": "「{to}」的会话关掉了，回答可能不完整。"}
+
+    def gate_tool(self, line_id: str, tool: str, data: dict, tool_use_id: str) -> tuple[bool, str]:
+        """Claude Code's own SendMessage, before it runs (claude.py's hook): to another session only with the
+        user's spoken yes, exactly these words to exactly this session."""
+        if tool != "SendMessage":
+            return False, "这个工具没有经过用户批准，没有执行。"
+        to, message = str(data.get("to") or "").strip(), str(data.get("message") or "")
+        if to == "main":
+            return True, ""  # a background subagent of this line reporting back: this line's own conversation
+        if not to or not message.strip():
+            return False, "没有要发的内容，没有发送。对方的回复由 voice-claude 自己读给用户，不用订阅。"
+        name = relay._strip_ref(to) or to
+        found = relay.find_target(to)
+        if found and self._own_line(found):
+            return False, (f"「{name}」是 voice-claude 自己的线（总机或项目线），不是 Claude 桌面版里的会话，没有发。"
+                           "照实告诉用户：要找的桌面会话不在这条线的 ListAgents 列表里。")
+        if not found and relay.DEFAULT_SESSIONS_DIR != relay.SESSIONS_DIR and relay.find_target(to, relay.DEFAULT_SESSIONS_DIR):
+            # the service runs Claude Code with its own CLAUDE_CONFIG_DIR: the desktop app's sessions are not its peers
+            return False, (f"「{name}」是另一套 Claude Code 设置里的会话（voice-claude 的 Claude Code 用的设置文件夹不是 "
+                           "~/.claude），这条线够不着它，没有发。照实告诉用户。")
+        flat = " ".join(message.split())
+        spoken = flat[:self.SPOKEN_CHARS] + (f"……等 {len(message)} 字" if len(flat) > self.SPOKEN_CHARS else "")
+        # Claude Code holds a message from a session of another permission-mode class until that session's user
+        # approves it, and SendMessage reports success all the same: said before the user says yes
+        theirs = relay.mode_class(relay.permission_mode(relay.transcript_path(found))) if found else ""
+        held = bool(theirs) and theirs != relay.mode_class(PERMISSION_MODE)
+        question = (f"我想发给「{name}」：{spoken}。它的权限模式和这条线不同，消息会先被扣住，要你在那个会话里批准才送到。可以吗？"
+                    if held else f"我想发给「{name}」：{spoken}，可以吗？")
+        ok, why = self.gate(line_id, "send_to_session", question, f"发给：{to}\n\n{message}")
+        if ok:
+            target = relay.find_target(to)
+            if target is None and self.RELAY_RETRY:
+                time.sleep(self.RELAY_RETRY)  # the registry may be mid-write: look once more before it is sent
+                target = relay.find_target(to)
+            path = relay.transcript_path(target) if target else None
+            try:
+                offset = path.stat().st_size if path and path.exists() else 0
+            except OSError:
+                offset = 0
+            with self.lock:
+                # noted now, with the size now: a copy of the same words still on its way for an older message is told
+                # apart from this one by when the user said yes (relay.expect)
+                expected = relay.expect(path, message, offset) if target else None
+                self.relays[tool_use_id] = {"line": line_id, "to": name, "message": message, "target": target,
+                                            "path": path, "offset": offset, "expected": expected, "held": held}
+        return ok, why or "用户同意了。"
+
+    def _own_line(self, entry: dict) -> bool:
+        """Is this registry entry one of voice-claude's own lines (the manager, a project line)?"""
+        ids = {l.session_id for l in self.lines.values()} - {""}
+        pids = {getattr(getattr(l.session, "proc", None), "pid", None) for l in self.lines.values()} - {None}
+        return entry.get("sessionId") in ids or int(entry.get("pid") or 0) in pids
+
+    def _on_gated_result(self, line_id: str, data: dict) -> None:
+        """An approved SendMessage ran: when it was delivered to a session on this machine, read its answer."""
+        with self.lock:
+            r = self.relays.pop(str(data.get("tool_use_id") or ""), None)
+        if r is None:
+            return
+        text = str(data.get("text") or "")
+        try:
+            result = json.loads(text)
+        except ValueError:
+            result = None
+        if not data.get("ok") or (isinstance(result, dict) and result.get("success") is False):
+            log.info("[%s] relay to %s: not delivered", line_id, r["to"])  # the line's model is told by the tool
+            relay.forget(r.get("expected"))
+            return
+        to = r["to"]
+        if r["target"] is None:
+            log.info("[%s] relay to %s: not a session on this machine, no answer to read", line_id, to)
+            self.emit("notice", {"text": self.RELAY_NOT_LOCAL.format(to=to)})
+            return
+        # a session in another permission-mode class: its user approves first (known from its transcript, or said
+        # in the tool's result)
+        held = bool(r.get("held")) or "held for the recipient" in text.lower()
+        if held:
+            self.emit("notice", {"text": self.RELAY_HELD.format(to=to)})
+
+        def on_state(state: str) -> None:
+            if state == "unreceived" and not held:
+                self.emit("notice", {"text": self.RELAY_UNRECEIVED_YET.format(to=to)})
+
+        sid = r["target"].get("sessionId")
+        rid = str(data.get("tool_use_id") or "")  # one wait per message: two to the same session are two waits
+        # while this is out, the window does not count as idle (a window opened from standby would close and stop us)
+        self.emit("relay_waiting", {"line": line_id, "to": to, "session": sid, "relay": rid})
+
+        def watch():
+            try:
+                # Claude Code's direct route returns the id its hand-over carries: the surest match when there is one
+                msg_id = str(result.get("msg_id") or "") if isinstance(result, dict) else ""
+                out = self.relay_watch(r["target"], r["path"], r["offset"], r["message"], on_state,
+                                       expected=r.get("expected"), msg_id=msg_id)
+            except Exception:
+                log.exception("[%s] relay watch failed", line_id)
+                out = {"text": "", "done": False, "session": sid, "why": "error"}
+            why = str(out.get("why") or "")
+            if out.get("done") and why != "superseded":
+                why = ""
+            if out.get("text"):
+                self.emit("relay_reply", {"line": line_id, "to": to, "text": out["text"], "relay": rid,
+                                          "session": out.get("session") or sid, "done": bool(out.get("done"))})
+                note = None if out.get("done") else self.RELAY_PARTIAL.get(why)
+            else:  # nothing to read out: no answer in time, an error, the session closed, or an answer with no words
+                self.emit("relay_done", {"line": line_id, "to": to, "session": out.get("session") or sid,
+                                         "relay": rid, "ok": bool(out.get("done")), "why": why})
+                note = self.RELAY_ENDED.get(why)
+            if note:
+                self.emit("notice", {"text": note.format(to=to)})
+
+        threading.Thread(target=watch, daemon=True, name=f"relay-{line_id}").start()
 
     def ask_frontend(self, line_id: str, action: str, question: str, detail: str = "", kind: str = "approve",
                      service: bool = False) -> bool | str:
@@ -1059,6 +1384,10 @@ class Switchboard:
                                           facts if isinstance(facts, list) else None), "brake": gen}
             ok, why = self.gate(line_id, action, q, detail, facts if isinstance(facts, dict) else None)
             return {"ok": ok, "message": why or "用户同意了。", "brake": gen}
+        if path == "record":
+            return self.record_topic(line_id, data)
+        if path in ("board_show", "board_look", "board_clear"):
+            return self.board_tool(line_id, path, data)
         if path == "brake":
             return {"ok": True, "message": "", "brake": self.brake_gen}
         if path == "frontend_pid":
@@ -1201,7 +1530,8 @@ class Switchboard:
         job = self.jobs.get(jid)
         if job is None or job.state != "running":
             return {"ok": False, "message": f"没有正在跑的后台任务 {jid}"}
-        ok, why = self.gate(line_id, "background_job", f"要停掉后台任务 {jid}（{job.note or job.command[:40]}），可以吗？")
+        ok, why = self.gate(line_id, "background_job", f"要停掉后台任务 {jid}（{job.note or job.command[:40]}），可以吗？",
+                            facts={"kind": "job_stop"})  # stopping starts nothing, whatever the job's command
         if not ok:
             return {"ok": False, "message": why}
         self.jobs.cancel(jid)
@@ -1278,6 +1608,10 @@ class Switchboard:
                 self.turn_started[line_id] = None  # log only the first delta of the turn
             self.emit(kind, {"line": line_id, **data})
             return
+        if kind == "done" and data.get("quiet"):  # the service's own turn (a record nudge): nothing to show or say
+            self._apply_pending(line)
+            self._emit_line(line)
+            return
         if kind == "done":
             if line.kind == MANAGER:
                 self._manager_log("总机", line.reply)
@@ -1292,6 +1626,32 @@ class Switchboard:
                 return
             self._apply_pending(line)
             self._emit_line(line)
+            return
+        if kind == "gated_result":
+            self._on_gated_result(line_id, data)
+            return
+        if kind == "writing":  # a long tool call still being written: shown so nobody stops it thinking nothing happens
+            self.emit("writing", {"line": line_id, **{k: data.get(k) for k in ("tool", "chars", "seconds", "done")}})
+            return
+        if kind == "usage":
+            turn_tokens = data.get("tokens") or {}
+            ev = {"line": line_id, "provider": line.provider, "model": str(data.get("model") or ""), "turn": data.get("turn"),
+                  "tokens": {k: int(turn_tokens.get(k) or 0) for k in ("input", "output", "cache_read", "cache_write")},
+                  # a cost only where Claude Code's prices are the vendor's: on Claude (an estimate with a subscription)
+                  "cost_usd": data.get("cost_usd") if line.provider == "claude" else None,
+                  "cost_basis": str(data.get("cost_basis") or "list"),
+                  # every model's share of the turn (subagents, compaction, helper models too): what the totals count
+                  "all_tokens": {k: int((data.get("all_tokens") or turn_tokens).get(k) or 0) for k in usage.FIELDS},
+                  "by_model": list(data.get("by_model") or [])}
+            if data.get("session") and data.get("baseline"):
+                self.usage.set_baseline(str(data["session"]), data["baseline"])
+            self.usage.add(line.provider, ev["all_tokens"], ev["cost_usd"])
+            self.last_usage[line_id] = ev
+            self.emit("usage", ev)
+            return
+        if kind == "limits":
+            if line.provider == "claude":  # Claude's plan windows; another vendor's quota is not reported this way
+                self._on_limits(data)
             return
         if kind == "rewind_failed":
             back, restored = self.rewound_backup.pop(line_id, ([], 0))
@@ -1322,7 +1682,12 @@ class Switchboard:
         if not (model or provider or restart) or line.state not in (IDLE, WAITING) or line.session is None \
                 or getattr(line.session, "turn_active", False):
             return  # WAITING also covers "mid-turn, a spoken approval is open": never restart under the user
+        if (model or provider) and not line.pending_nudged and self._nudge_record(line):
+            line.pending_nudged = True  # once for this switch, even if the user speaks during it
+            return  # the old model records the topic first; its quiet turn's end brings us back here
         line.pending_model, line.pending_provider, line.pending_restart = None, None, False
+        line.pending_nudged = False
+        self._fresh_prompt(line)
         try:
             if provider:
                 st = self.provider_status(provider)
@@ -1362,6 +1727,7 @@ class Switchboard:
         line.first_turn_after_switch = False
         name = accessmod.provider_for(line.provider, self.cfg).name
         try:
+            self._fresh_prompt(line)
             line.session.restart(fresh=True)
             line.state = IDLE
             line.turn_log.clear()
@@ -1410,6 +1776,7 @@ class Switchboard:
         """Start a dead line's process again, continuing its own conversation; '' on success, else why not."""
         try:
             line.started_resume, line.ready_seen, line.started_at = line.session_id, False, line.now()
+            self._fresh_prompt(line)
             line.session.restart()
             line.state = IDLE
         except Exception as e:
@@ -1417,6 +1784,22 @@ class Switchboard:
             return f"{line.name}重新连接不上：{e}"
         self.emit("notice", {"text": f"{line.name}已重新连接"})
         return ""
+
+    def _on_limits(self, info: dict) -> None:
+        now = time.time()
+        snap = usage.snapshot(info, now)
+        before = (self.usage.limits().get("claude") or {}).get("status")
+        self.usage.set_limits("claude", snap)
+        self.emit("limits", snap)
+        if snap["status"] in ("allowed_warning", "rejected") and snap["status"] != before:
+            self.emit("notice", {"text": usage.limit_notice(snap, now)})
+
+    def usage_report(self) -> dict:
+        """The window's usage view: today and since this service started, per provider; the latest quota snapshot
+        per provider (Claude only for now); each line's latest turn."""
+        limits = self.usage.limits()
+        return {"ok": True, "message": "", "today": self.usage.today(), "since_start": self.usage.since_start(),
+                "limits": {p: limits.get(p) for p in accessmod.PROVIDER_ORDER}, "last_turn": dict(self.last_usage)}
 
     def _forgotten(self, key: str) -> bool:
         return key in self.forgotten
@@ -1441,6 +1824,8 @@ class Switchboard:
             if line:
                 line.post("error", job.spoken)
             self.emit("notice", {"text": job.spoken})
+            if line and job.line == self.active_id:
+                line.mark_read()  # announced to the user just now, on the line in front
         elif job.state == "done":
             if line:
                 line.post("job", job.spoken)
@@ -1459,6 +1844,8 @@ class Switchboard:
                 if l.kind != "project" or l.state in (DEAD, CLOSED) or l.id == self.active_id or l.keep_alive:
                     continue
                 if self.now() - l.last_used > self.idle_seconds:
+                    if self._nudge_record(l):
+                        continue  # it writes its record first (busy meanwhile, so kept); closed on a later tick
                     self._close_line(l, "闲置太久")
             pending = [l for l in self.lines.values() if l.pending_model or l.pending_provider or l.pending_restart]
         for l in pending:  # outside the lock: a switch may start the gateway, which takes seconds
@@ -1524,7 +1911,12 @@ class Switchboard:
                 "unread": sum(len(l.unread()) for l in self.lines.values())}
 
     def shutdown(self) -> None:
-        """Close every line and the translation gateway. Background jobs keep running."""
+        """Close every line and the translation gateway. Background jobs keep running. Project lines with a topic not
+        yet recorded write it first (SHUTDOWN_RECORD_WAIT at most)."""
+        writing = [l for l in list(self.lines.values()) if self._nudge_record(l)]
+        until = time.monotonic() + self.SHUTDOWN_RECORD_WAIT
+        while writing and any(l.quiet for l in writing) and time.monotonic() < until:
+            time.sleep(0.2)
         self.stopping = True
         self._cancel_pending(None)
         try:

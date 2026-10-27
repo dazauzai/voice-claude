@@ -68,6 +68,10 @@ class Line:
         self.busy_since: float | None = None
         self.last_used = now()
         self.turns = 0
+        self.turns_since_record = 0  # the user's turns since this line last wrote a record (records.py)
+        self.record_asked = False  # nudged since; a new turn of the user's clears it
+        self.pending_nudged = False  # nudged for the model / provider switch waiting to be made
+        self.quiet, self.nudged_at = False, 0.0  # a turn of the service's own is running: nothing of it shown or said
         self.provider = "claude"  # who answers on this line; the switchboard sets it before start()
         self.engine = "claude"  # "claude" (Claude Code) or "codex" (the user's own Codex), chosen when the session is made
         self.pending_model: str | None = None  # applied once the current turn is over
@@ -114,6 +118,8 @@ class Line:
         self.state = WORKING
         self.busy_since = self.now()
         self.sending = True
+        if self.quiet and not getattr(self.session, "turn_active", False):
+            self.quiet = False  # a quiet turn that never ended (its process went away): this is the user's turn
         try:
             self.session.send(f"{self.pending_note}\n{text}" if self.pending_note else text)
         except Exception:
@@ -128,6 +134,8 @@ class Line:
         self.pending_note = ""
         self.last_used = self.now()
         self.turns += 1
+        self.turns_since_record += 1
+        self.record_asked = False
         if len(self.turn_log) > 200:
             del self.turn_log[:-200]
             self.log_from_start, self.base_point = False, None  # the oldest turns are no longer known
@@ -142,6 +150,7 @@ class Line:
         if self.session is None:
             return
         self.session.kill()
+        self.quiet = False
         try:
             self.session.restart()
             self.state = IDLE
@@ -152,7 +161,21 @@ class Line:
     def close(self) -> None:
         if self.session is not None:
             self.session.close()
-        self.state = CLOSED
+        self.state, self.quiet = CLOSED, False
+
+    def nudge(self, text: str) -> bool:
+        """A quiet turn of the service's own (the record nudge): nothing of it is shown, read out or kept as news, and
+        it is no turn of the user's (no rewind point, not counted). Only when the line is idle."""
+        if self.session is None or self.state != IDLE:
+            return False
+        self.quiet, self.nudged_at = True, self.now()
+        self.state, self.busy_since = WORKING, self.now()
+        try:
+            self.session.send(text)
+        except Exception:
+            self.quiet, self.state, self.busy_since = False, IDLE, None
+            return False
+        return True
 
     @property
     def busy(self) -> bool:
@@ -200,6 +223,22 @@ class Line:
     # ---------- events from the session ----------
 
     def on_session(self, kind: str, data: Any) -> None:
+        if self.quiet and kind in ("text", "tool", "writing"):
+            return  # the service's own turn: not the user's conversation
+        if self.quiet and kind == "mark":
+            # its end moves the last turn's end, so a rewind of the next sentence drops that sentence alone; a rewind
+            # of the last turn drops the quiet turn with it (two turns: the switchboard's rewind knows)
+            if self.turn_log and data.get("last"):
+                self.turn_log[-1]["last"] = data["last"]
+                self.turn_log[-1]["quiet_after"] = True
+            return
+        if self.quiet and kind == "done":
+            self.quiet = False
+            if self.state != DEAD and not self.sending:  # (the user may have spoken meanwhile: their turn is next)
+                self.state = IDLE
+                self.busy_since = None
+            self.on_event(self.id, "done", {"status": data.get("status", "ok"), "last": "", "kind": None, "quiet": True})
+            return
         if kind == "ready":
             # Arrives after every message in stream-json mode (not at process start); the first one marks the
             # moment Claude Code accepted the first message.
@@ -252,11 +291,15 @@ class Line:
             if what and self.kind != "manager":  # the manager's replies are conversation, not news to keep
                 self.post(what, last if what != "error" else f"出错了：{(data.get('message') or '')[:80]}")
             self.on_event(self.id, "done", {"status": status, "last": last, "kind": what})
+        elif kind == "usage":
+            self.on_event(self.id, "usage", {**data, "turn": self.turn_log[-1]["turn"] if self.turn_log else None})
+        elif kind in ("limits", "gated_result", "writing"):
+            self.on_event(self.id, kind, data)
         elif kind == "rewind_failed":
             self.on_event(self.id, "rewind_failed", data or {})
         elif kind == "exit":
             busy = self.state in (WORKING, WAITING)  # the user is waiting for an answer that will never come
-            self.state = DEAD
+            self.state, self.quiet = DEAD, False  # a quiet turn that went with the process never ends
             self.busy_since = None
             self.post("error", "程序退出了")
             self.on_event(self.id, "dead", {"code": data, "busy": busy})

@@ -4,3 +4,4 @@ sounddevice
 mcp>=2
 pyautogui
 pillow
+pywebview

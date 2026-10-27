@@ -1,11 +1,12 @@
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from voiceclaude import config, jobs, paths, switchboard
+from voiceclaude import config, jobs, paths, records, switchboard
 from voiceclaude.line import WORKING
 from voiceclaude.projects import Project
 from voiceclaude.switchboard import MANAGER, SCRATCH, Switchboard
@@ -71,6 +72,7 @@ class SwitchboardTests(unittest.TestCase):
         for name in ("HOME_DIR", "MANAGER_DIR", "MANAGER_LOG_DIR", "SCRATCH_DIR", "JOBS_DIR", "LINES_DIR"):
             mock.patch.object(paths, name, self.tmp / name.lower()).start()
         mock.patch.object(paths, "LINES_FILE", self.tmp / "lines.json").start()
+        mock.patch.object(paths, "USAGE_FILE", self.tmp / "usage.json").start()
         mock.patch.object(paths, "PROJECTS_FILE", self.tmp / "projects.toml").start()
         mock.patch.object(paths, "AUTH_FILE", self.tmp / "auth.json").start()  # never the user's real key file
         from voiceclaude import access
@@ -315,6 +317,20 @@ class SwitchboardTests(unittest.TestCase):
         self.assertIn("做完了", self.sb.control_request(line.id, "job_status", {"id": jid})["message"])
         self.assertIn("试一下", self.sb.background_status_text())
         self.assertFalse(self.sb.control_request(line.id, "run_in_background", {"command": ""})["ok"])
+
+    def test_a_failed_job_announced_on_the_line_in_front_is_read(self):
+        """The window counts unread as "not idle": what was just said out loud must not stay unread."""
+        from types import SimpleNamespace
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        mock.patch.object(self.jobs, "tail", lambda *a: "").start()
+        job = SimpleNamespace(id="j1", state="failed", note="编译", line=line.id, spoken="后台任务 j1（编译）失败了。")
+        self.sb.on_job_change(job)
+        self.assertIn("后台任务 j1（编译）失败了。", self.notices())
+        self.assertEqual(line.unread(), [])
+        self.sb.switch_to_project("Beacon")  # Atlas is in the background now: its failure waits for the user
+        self.sb.on_job_change(job)
+        self.assertEqual([m["text"] for m in line.unread()], ["后台任务 j1（编译）失败了。"])
 
     def test_remember_alias_and_list(self):
         r = self.sb.control_request(MANAGER, "remember_alias", {"alias": "基准", "project": "benchmarking"})
@@ -608,6 +624,59 @@ class SwitchboardTests(unittest.TestCase):
         self.assertFalse(self.sb.request_shutdown().get("shutdown"))
         self.assertTrue(self._wait(lambda: closed == [1]))
         self.assertTrue(self.sb.request_shutdown(jobs="keep").get("shutdown"))  # the window's own quit: it asked already
+
+    def test_usage_events_ledger_report_and_phrase(self):
+        """Each Claude Code result: a 'usage' event with the line, provider, model, turn, tokens and (Claude only) the
+        cost; the ledger counts it; the report and 用量怎么样 tell it back."""
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        r = self.sb.say(line.id, "一")
+        self.events.clear()
+        line.on_session("usage", {"model": "claude-haiku-4-5", "tokens": {"input": 20000, "output": 1200, "cache_read": 12000,
+                                                                          "cache_write": 0}, "cost_usd": 0.01, "cost_basis": "list"})
+        ev = [d for k, d in self.events if k == "usage"][0]
+        self.assertEqual({k: ev[k] for k in ("line", "provider", "model", "turn", "tokens", "cost_usd", "cost_basis")},
+                         {"line": line.id, "provider": "claude", "model": "claude-haiku-4-5", "turn": r["turn"],
+                          "tokens": {"input": 20000, "output": 1200, "cache_read": 12000, "cache_write": 0},
+                          "cost_usd": 0.01, "cost_basis": "list"})
+        self.assertEqual(ev["all_tokens"]["input"], 20000)  # no modelUsage given: the turn's own tokens
+        self.assertNotIn("baseline", ev)  # bookkeeping stays in the service
+        line.provider = "deepseek"  # another vendor: its tokens are counted, no cost is claimed for it
+        line.on_session("usage", {"model": "deepseek-flash", "tokens": {"input": 500, "output": 80}, "cost_usd": 0.002})
+        self.assertIsNone([d for k, d in self.events if k == "usage"][-1]["cost_usd"])
+        rep = self.sb.usage_report()
+        self.assertEqual((rep["today"]["claude"]["turns"], rep["today"]["deepseek"]["turns"], rep["today"]["deepseek"]["cost_usd"]), (1, 1, 0.0))
+        self.assertEqual(rep["since_start"]["claude"]["input"], 20000)
+        self.assertEqual(rep["limits"], {"claude": None, "deepseek": None, "kimi": None, "openai": None})
+        self.assertEqual(rep["last_turn"][line.id]["provider"], "deepseek")
+        line.provider = "claude"
+        info = {"status": "allowed", "resetsAt": 1792760400, "rateLimitType": "five_hour",
+                "unifiedWindows": {"five_hour": {"utilization": 0.08, "resetsAt": 1792760400}, "seven_day": {"utilization": 0.75}}}
+        line.on_session("limits", info)
+        lim = [d for k, d in self.events if k == "limits"][-1]
+        self.assertEqual((lim["provider"], lim["status"], lim["windows"]["seven_day"]["used"]), ("claude", "allowed", 0.75))
+        self.assertEqual(self.sb.usage_report()["limits"]["claude"]["status"], "allowed")
+        spoken = self.sb.phrase("usage_status")["spoken"]
+        self.assertTrue(spoken.startswith("Claude 这周额度用了 75%，5 小时窗口用了 8%。"), spoken)
+        self.assertIn("Claude今天用了 1 轮，输入 3.2 万、输出 1200 token。", spoken)  # 2 万 + 1.2 万 from the cache
+        self.assertNotIn("额度快用完了", "".join(self.notices()))
+        warn = {**info, "status": "allowed_warning", "unifiedWindows": {"five_hour": {"utilization": 0.9, "resetsAt": 1792760400}}}
+        line.on_session("limits", warn)
+        line.on_session("limits", warn)  # the same status again: said once
+        self.assertEqual(sum("额度快用完了" in n for n in self.notices()), 1)
+        line.on_session("limits", {**info, "status": "rejected"})
+        self.assertTrue(any(n.startswith("Claude 的额度用完了") for n in self.notices()))
+
+    def test_usage_totals_count_every_model_and_baselines_are_kept(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self.sb.say(line.id, "一")
+        line.on_session("usage", {"model": "claude-opus-5-5", "tokens": {"input": 5, "output": 65},
+                                  "all_tokens": {"input": 905, "output": 185, "cache_read": 0, "cache_write": 0, "web_search": 2},
+                                  "cost_usd": 0.0037, "session": "S9", "baseline": {"models": {"m": {"cost": 1.0}}, "cost": 1.0}})
+        today = self.sb.usage_report()["today"]["claude"]
+        self.assertEqual((today["input"], today["output"], today["web_search"], today["cost_usd"]), (905, 185, 2, 0.0037))
+        self.assertEqual(self.sb.usage.baseline("S9")["cost"], 1.0)  # a later resume of S9 starts from here
 
     def test_the_windows_own_quit_after_its_own_dialog(self):
         """× / 退出 voice-claude: the window already asked about the busy line; the service must not ask again (the
@@ -1385,6 +1454,594 @@ class SwitchboardTests(unittest.TestCase):
                                [dict(f, window="确认另存为") for f in steps])
         q = [d for k, d in self.events if k == "ask"][0]["question"]
         self.assertEqual(q, "会覆盖已有文件：我想在“确认另存为”里：点一下是，然后按回车，可以吗？")  # one reason, no list of steps
+
+    def _answer_asks(self, yes=True, count=1):
+        """Answer the next `count` spoken questions from another thread, the way the window would."""
+        def run():
+            done = set()
+            for _ in range(200):
+                for k, d in list(self.events):
+                    if k == "ask" and d["request"] not in done:
+                        done.add(d["request"])
+                        self.sb.answer(d["request"], yes)
+                if len(done) >= count:
+                    return
+                time.sleep(0.01)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t
+
+    def test_send_message_to_another_session_is_asked_out_loud_even_in_transparent_mode(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        target = {"sessionId": "S", "name": "论文写作辅助", "cwd": "D:\\thesis", "_file": ""}
+        transcript = self.tmp / "S.jsonl"
+        transcript.write_text("x" * 7, "utf-8")
+        mock.patch.object(switchboard.relay, "find_target", lambda to, d=None: target if "论文" in to else None).start()
+        mock.patch.object(switchboard.relay, "transcript_path", lambda t: transcript).start()
+        watched = []
+        self.sb.relay_watch = lambda *a, **kw: (watched.append(a[:4]), kws.append(kw),
+                                                {"text": "引言改好了。", "done": True, "session": "S"})[2]
+        kws = []
+        self.cfg.transparent = True
+        self.events.clear()
+        self._answer_asks(True)
+        ok, why = self.sb.gate_tool(line.id, "SendMessage", {"to": "论文写作辅助 [3fa9c1]", "message": "用户口述：把引言改短"}, "tu1")
+        self.assertEqual((ok, why), (True, "用户同意了。"))
+        ask = [d for k, d in self.events if k == "ask"][0]
+        self.assertEqual((ask["action"], ask["question"]), ("send_to_session", "我想发给「论文写作辅助」：用户口述：把引言改短，可以吗？"))
+        self.assertEqual(ask["detail"], "发给：论文写作辅助 [3fa9c1]\n\n用户口述：把引言改短")
+        self.assertEqual(self.sb.relays["tu1"]["offset"], 7)  # the answer is looked for after what was there already
+        # delivered: the service reads the answer itself and hands it to the window
+        expected = self.sb.relays["tu1"]["expected"]
+        self.assertEqual((expected.offset, expected.skip), (7, 0))  # noted at the spoken yes, with the size then
+        line.on_session("gated_result", {"tool": "SendMessage", "tool_use_id": "tu1", "ok": True,
+                                         "text": '{"success":true,"msg_id":"m-1"}'})
+        self.assertTrue(self._wait(lambda: any(k == "relay_reply" for k, d in self.events), timeout=3))
+        self.assertEqual([(k, d) for k, d in self.events if k.startswith("relay_")],
+                         [("relay_waiting", {"line": line.id, "to": "论文写作辅助", "session": "S", "relay": "tu1"}),
+                          ("relay_reply", {"line": line.id, "to": "论文写作辅助", "text": "引言改好了。", "session": "S",
+                                           "relay": "tu1", "done": True})])  # one id per message: two to S are two waits
+        self.assertEqual(watched, [(target, transcript, 7, "用户口述：把引言改短")])
+        self.assertEqual(kws, [{"expected": expected, "msg_id": "m-1"}])  # the id its hand-over carries
+        self.assertEqual(self.notices(), [])  # an answer that came back needs no notice
+        # a long message: the first 80 characters are read out, all of it is shown
+        long = "用户口述：" + "很长的一段话" * 30
+        self.events.clear()
+        self._answer_asks(False)
+        ok, why = self.sb.gate_tool(line.id, "SendMessage", {"to": "论文写作辅助", "message": long}, "tu2")
+        self.assertFalse(ok)
+        self.assertEqual(why, "用户没有同意，没有执行。不要再试同一个动作，口头说一句就好。")
+        q = [d for k, d in self.events if k == "ask"][0]["question"]
+        self.assertTrue(q.endswith(f"……等 {len(long)} 字，可以吗？"), q)
+        self.assertIn(long, [d for k, d in self.events if k == "ask"][0]["detail"])
+        self.assertNotIn("tu2", self.sb.relays)
+        # the permissions table; a subagent reporting to its own line; nothing to send; another tool
+        self.cfg.permissions["send_to_session"] = "deny"
+        self.events.clear()
+        self.assertFalse(self.sb.gate_tool(line.id, "SendMessage", {"to": "论文写作辅助", "message": "hi"}, "tu3")[0])
+        self.assertEqual([k for k, d in self.events if k == "ask"], [])
+        self.assertEqual(self.sb.gate_tool(line.id, "SendMessage", {"to": "main", "message": "做完了"}, "tu4"), (True, ""))
+        self.cfg.permissions["send_to_session"] = "ask"
+        self.assertFalse(self.sb.gate_tool(line.id, "SendMessage", {"to": "论文写作辅助", "message": " "}, "tu5")[0])
+        self.assertFalse(self.sb.gate_tool(line.id, "Bash", {"command": "dir"}, "tu6")[0])
+
+    def test_a_wait_that_ends_with_nothing_to_read_out_is_reported(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        target = {"sessionId": "S", "name": "论文写作辅助"}
+        outcomes = [{"text": "", "done": False, "session": "S", "why": "timeout"}, RuntimeError("boom"),
+                    {"text": "", "done": True, "session": "S", "why": ""},
+                    {"text": "", "done": True, "session": "S", "why": "superseded"}]
+
+        def watch(*a, **kw):
+            o = outcomes.pop(0)
+            if isinstance(o, Exception):
+                raise o
+            return o
+
+        self.sb.relay_watch = watch
+        self.events.clear()
+        for i in range(4):
+            self.sb.relays[f"tu{i}"] = {"line": line.id, "to": "论文写作辅助", "message": "m", "target": target, "path": None, "offset": 0}
+            line.on_session("gated_result", {"tool": "SendMessage", "tool_use_id": f"tu{i}", "ok": True, "text": ""})
+            self.assertTrue(self._wait(lambda: len([k for k, d in self.events if k == "relay_done"]) == i + 1, timeout=3))
+        done = [d for k, d in self.events if k == "relay_done"]
+        self.assertEqual([(d["ok"], d["why"], d["session"], d["to"]) for d in done],
+                         [(False, "timeout", "S", "论文写作辅助"), (False, "error", "S", "论文写作辅助"), (True, "", "S", "论文写作辅助"),
+                          (True, "superseded", "S", "论文写作辅助")])
+        self.assertEqual([d["relay"] for d in done], ["tu0", "tu1", "tu2", "tu3"])
+        self.assertEqual(self.notices(), ["「论文写作辅助」还没回答。", "读「论文写作辅助」的回答时出错了。",
+                                          "「论文写作辅助」做完了，没有文字回答。"])  # said, not dropped
+        self.assertEqual(len([k for k, d in self.events if k == "relay_waiting"]), 4)  # a later message took over: no notice
+        self.assertEqual([k for k, d in self.events if k == "relay_reply"], [])
+
+    def test_not_received_held_partial_and_refused_sends(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        target = {"sessionId": "S", "name": "论文写作辅助"}
+        plan = []
+        self.events.clear()
+
+        def watch(target, path, offset, message, on_state, **kw):
+            on_state("unreceived")
+            return plan.pop(0)
+
+        self.sb.relay_watch = watch
+
+        def relay_of(i, text, ok=True):
+            self.sb.relays[f"tu{i}"] = {"line": line.id, "to": "论文写作辅助", "message": "m", "target": target, "path": None, "offset": 0}
+            line.on_session("gated_result", {"tool": "SendMessage", "tool_use_id": f"tu{i}", "ok": ok, "text": text})
+
+        # not seen there after a while: said once, while still waiting; then it never came
+        plan.append({"text": "", "done": False, "session": "S", "why": "unreceived"})
+        relay_of(1, '{"success":true}')
+        self.assertTrue(self._wait(lambda: len(self.notices()) == 2, timeout=3))
+        self.assertEqual(self.notices(), ["「论文写作辅助」还没收到这句话，可能在桌面应用里等你批准。", "「论文写作辅助」没有收到这句话。"])
+        # held for approval over there (a session in another permission mode): said at once, not twice
+        self.events.clear()
+        plan.append({"text": "", "done": False, "session": "S", "why": "stopped"})
+        relay_of(2, "Your message is held for the recipient user's approval before it reaches their Claude session.")
+        self.assertTrue(self._wait(lambda: any(k == "relay_done" for k, d in self.events), timeout=3))
+        self.assertEqual(self.notices(), ["「论文写作辅助」把这条消息扣住了：要你在那个会话里批准，它才收得到；不批准，过一阵就作废。"])
+        # a partial answer: read out, marked not done, and the user is told the rest is over there
+        self.events.clear()
+        plan.append({"text": "我先核对一遍。", "done": False, "session": "S", "why": "working"})
+        relay_of(3, '{"success":true}')
+        self.assertTrue(self._wait(lambda: any(k == "relay_reply" for k, d in self.events), timeout=3))
+        self.assertTrue(self._wait(lambda: "「论文写作辅助」还在做，回答稍后看它的对话。" in self.notices(), timeout=3))
+        self.assertFalse([d for k, d in self.events if k == "relay_reply"][0]["done"])
+        # the tool said it was not sent: nothing to wait for (the line's model is told by the tool itself)
+        self.events.clear()
+        relay_of(4, '{"success":false,"message":"No session named x"}')
+        time.sleep(0.05)
+        self.assertEqual([k for k, d in self.events if k.startswith("relay_") or k == "notice"], [])
+
+    def test_a_tool_call_being_written_reaches_the_window(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        line.on_session("writing", {"tool": "mcp__desktop__type_text", "chars": 1200, "seconds": 20, "done": False})
+        self.assertIn(("writing", {"line": line.id, "tool": "mcp__desktop__type_text", "chars": 1200, "seconds": 20,
+                                   "done": False}), self.events)
+
+    def test_the_same_words_said_again_are_noted_at_each_yes(self):
+        """Two approvals of the same words to one session: the second is told it comes after the first, and a send that
+        did not go out stops counting."""
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        transcript = self.tmp / "S2.jsonl"
+        transcript.write_text("", "utf-8")
+        target = {"sessionId": "S2", "name": "论文写作辅助", "cwd": "D:\\thesis", "_file": ""}
+        mock.patch.object(switchboard.relay, "find_target", lambda to, d=None: target).start()
+        mock.patch.object(switchboard.relay, "transcript_path", lambda t: transcript).start()
+        for tid in ("tu1", "tu2", "tu3"):
+            self.events.clear()
+            self._answer_asks(True)
+            self.assertTrue(self.sb.gate_tool(line.id, "SendMessage", {"to": "论文写作辅助", "message": "用户口述：在吗"}, tid)[0])
+        self.assertEqual([self.sb.relays[t]["expected"].skip for t in ("tu1", "tu2", "tu3")], [0, 1, 2])
+        line.on_session("gated_result", {"tool": "SendMessage", "tool_use_id": "tu2", "ok": False, "text": "failed"})
+        self.events.clear()
+        self._answer_asks(True)
+        self.assertTrue(self.sb.gate_tool(line.id, "SendMessage", {"to": "论文写作辅助", "message": "用户口述：在吗"}, "tu4")[0])
+        self.assertEqual(self.sb.relays["tu4"]["expected"].skip, 2)  # tu1 and tu3: the one that failed is forgotten
+        for t in ("tu1", "tu3", "tu4"):
+            switchboard.relay.forget(self.sb.relays.pop(t)["expected"])
+
+    def test_a_session_in_another_permission_mode_holds_the_message_and_the_user_is_told(self):
+        """问题解决 bypasses permission prompts, the line does not: Claude Code holds the message until the user approves
+        it there, while SendMessage reports success. Said in the question and again once it is sent."""
+        import json
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        target = {"sessionId": "S", "name": "问题解决", "cwd": "C:\\vc", "_file": ""}
+        transcript = self.tmp / "S.jsonl"
+        transcript.write_text(json.dumps({"type": "user", "permissionMode": "bypassPermissions"}) + "\n", "utf-8")
+        mock.patch.object(switchboard.relay, "find_target", lambda to, d=None: target).start()
+        mock.patch.object(switchboard.relay, "transcript_path", lambda t: transcript).start()
+        self.sb.relay_watch = lambda *a, **kw: {"text": "", "done": False, "session": "S", "why": "unreceived"}
+        self.events.clear()
+        self._answer_asks(True)
+        ok, _ = self.sb.gate_tool(line.id, "SendMessage", {"to": "问题解决", "message": "用户口述：白板坏了"}, "tu1")
+        self.assertTrue(ok)
+        q = [d for k, d in self.events if k == "ask"][0]["question"]
+        self.assertEqual(q, "我想发给「问题解决」：用户口述：白板坏了。它的权限模式和这条线不同，消息会先被扣住，要你在那个会话里批准才送到。可以吗？")
+        line.on_session("gated_result", {"tool": "SendMessage", "tool_use_id": "tu1", "ok": True,
+                                         "text": '{"success":true,"msg_id":"m-1"}'})
+        self.assertTrue(self._wait(lambda: any(k == "relay_done" for k, d in self.events), timeout=3))
+        self.assertEqual(self.notices(), [switchboard.Switchboard.RELAY_HELD.format(to="问题解决"),
+                                          switchboard.Switchboard.RELAY_ENDED["unreceived"].format(to="问题解决")])
+        # the same mode class: asked as usual
+        transcript.write_text(json.dumps({"type": "user", "permissionMode": "auto"}) + "\n", "utf-8")
+        self.events.clear()
+        self._answer_asks(False)
+        self.sb.gate_tool(line.id, "SendMessage", {"to": "问题解决", "message": "在吗"}, "tu2")
+        self.assertEqual([d for k, d in self.events if k == "ask"][0]["question"], "我想发给「问题解决」：在吗，可以吗？")
+        from voiceclaude import prompts
+        self.assertIn("SendMessage 返回成功只说明发出去了", prompts.PROJECT_PROMPT)
+
+    def test_a_relay_that_was_not_delivered_or_has_no_local_session_is_not_watched(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self.sb.RELAY_RETRY = 0
+        self.events.clear()
+        mock.patch.object(switchboard.relay, "find_target", lambda to, d=None: None).start()  # a cloud session, say
+        self.sb.relay_watch = lambda *a, **kw: self.fail("nothing to watch")
+        self._answer_asks(True)
+        self.assertTrue(self.sb.gate_tool(line.id, "SendMessage", {"to": "云端", "message": "hi"}, "tu1")[0])
+        line.on_session("gated_result", {"tool": "SendMessage", "tool_use_id": "tu1", "ok": True, "text": ""})
+        self.sb.relays["tu2"] = {"line": line.id, "to": "x", "message": "m", "target": {"sessionId": "S"}, "path": None, "offset": 0}
+        line.on_session("gated_result", {"tool": "SendMessage", "tool_use_id": "tu2", "ok": False, "text": "no such session"})
+        time.sleep(0.05)
+        self.assertEqual([k for k, d in self.events if k.startswith("relay_")], [])  # nothing waits
+        self.assertEqual(self.sb.relays, {})
+        self.assertEqual(self.notices(), ["「云端」不是这台电脑上开着的会话，它的回答这里读不到。"])
+
+    def test_no_relay_to_our_own_lines_or_to_a_session_this_line_cannot_reach(self):
+        """manager-44 in ListAgents is voice-claude's own line, not a desktop session; and when the service runs
+        Claude Code with its own CLAUDE_CONFIG_DIR, the desktop app's sessions are not its peers. Said, not asked."""
+        import json
+        from voiceclaude import prompts
+        self.assertIn("manager-数字 是 voice-claude 的总机", prompts.PROJECT_PROMPT)
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self.sb.lines[MANAGER].session_id = "own-1"
+        reachable, desktop_app = self.tmp / "cfg" / "sessions", self.tmp / "home" / "sessions"
+        for d, entry in ((reachable, {"sessionId": "own-1", "pid": 1, "name": "manager-44"}),
+                         (desktop_app, {"sessionId": "D", "pid": 2, "name": "问题解决"})):
+            d.mkdir(parents=True)
+            (d / f"{entry['pid']}.json").write_text(json.dumps(entry, ensure_ascii=False), "utf-8")
+        mock.patch.multiple(switchboard.relay, SESSIONS_DIR=reachable, DEFAULT_SESSIONS_DIR=desktop_app).start()
+        self.events.clear()
+        ok, why = self.sb.gate_tool(line.id, "SendMessage", {"to": "manager-44", "message": "在吗"}, "tu1")
+        self.assertFalse(ok)
+        self.assertIn("voice-claude 自己的线", why)
+        ok, why = self.sb.gate_tool(line.id, "SendMessage", {"to": "问题解决", "message": "在吗"}, "tu2")
+        self.assertFalse(ok)
+        self.assertIn("另一套 Claude Code 设置", why)
+        self.assertEqual([k for k, d in self.events if k == "ask"], [])  # nothing asked that cannot be sent
+        # the usual setup (one folder): the desktop app's sessions are the line's peers, and the message is asked
+        mock.patch.object(switchboard.relay, "SESSIONS_DIR", desktop_app).start()
+        self.assertFalse(self.sb.gate_tool(line.id, "SendMessage", {"to": "问题解决", "message": "在吗"}, "tu3")[0])  # nobody answers
+        self.assertEqual([d["action"] for k, d in self.events if k == "ask"], ["send_to_session"])
+
+    def test_desktop_steps_that_reach_another_claude_are_asked_like_a_message(self):
+        """type = allow is not allow for starting Claude in a terminal or typing into a Claude session's window."""
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self.cfg.permissions.update(type="allow", hotkey="allow", click="allow")
+        typed = {"kind": "type", "text": "claude -p hi\n", "window": "Windows PowerShell"}
+        self.events.clear()
+        self.assertFalse(self.sb.gate(line.id, "type", "我想输入文字：claude -p hi，可以吗？", "", typed)[0])  # nobody answers
+        q = [d for k, d in self.events if k == "ask"][0]["question"]
+        self.assertTrue(q.startswith("会另开一个 Claude"), q)
+        session = [{"kind": "type", "text": "请重写引言", "window": "Claude", "session": True},
+                   {"kind": "hotkey", "keys": ["enter"], "window": "Claude", "session": True}]
+        self.events.clear()
+        r = self.sb.gate_batch(line.id, "我想输入文字：请重写引言，然后按回车，可以吗？", ["type", "hotkey"], "", session)
+        self.assertFalse(r["ok"])  # asked (all-allow does not skip it), nobody answered
+        self.assertTrue([d for k, d in self.events if k == "ask"][0]["question"].startswith("这是另一个 Claude 会话的窗口"))
+        self.cfg.permissions["send_to_session"] = "deny"
+        self.assertFalse(self.sb.gate(line.id, "type", "q", "", typed)[0])
+        r = self.sb.gate_batch(line.id, "q", ["type", "hotkey"], "", session)
+        self.assertIn("发消息给别的 Claude 会话", r["message"])
+        self.cfg.permissions["send_to_session"] = "allow"  # the user lets words go to other sessions: as the table says
+        self.assertTrue(self.sb.gate_batch(line.id, "q", ["type", "hotkey"], "", session)["ok"])
+        self.assertEqual(self.sb.gate(line.id, "type", "q", "", {"kind": "type", "text": "hello", "window": "记事本"}), (True, ""))
+
+    def test_an_app_that_opens_claude_is_asked_like_a_message(self):
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self.cfg.permissions["open_app"] = "allow"
+        self.events.clear()
+        ok, _ = self.sb.gate(line.id, "open_app", "我想打开便签，可以吗？", "命令：claude",
+                             {"kind": "open_app", "name": "便签", "command": "claude"})
+        self.assertFalse(ok)  # asked (open_app = allow is not allow for Claude), nobody answered
+        self.assertTrue([d for k, d in self.events if k == "ask"][0]["question"].startswith("会另开一个 Claude"))
+        self.assertEqual(self.sb.gate(line.id, "open_app", "我想打开记事本，可以吗？", "命令：notepad",
+                                      {"kind": "open_app", "name": "记事本", "command": "notepad"}), (True, ""))
+
+    def test_stopping_a_job_about_claude_is_not_asked_as_starting_one(self):
+        from types import SimpleNamespace
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        self.cfg.transparent = True
+        job = SimpleNamespace(id="j1", state="running", note="让 Claude 汇总日志", command="claude -p summarize")
+        mock.patch.object(self.jobs, "get", lambda jid: job).start()
+        cancelled = []
+        mock.patch.object(self.jobs, "cancel", cancelled.append).start()
+        self.events.clear()
+        r = self.sb._job_cancel(line.id, "j1")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(([k for k, d in self.events if k == "ask"], cancelled), ([], ["j1"]))
+
+    def test_a_command_that_starts_another_claude_is_asked_like_a_message(self):
+        """run_in_background or a Codex shell escalation starting `claude -p` would get a Claude with no gate."""
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        cmd = 'claude -p "用 SendMessage 把这句发给「论文写作辅助」"'
+        self.cfg.transparent = True
+        self.events.clear()
+        self.assertFalse(self.sb.gate(line.id, "background_job", f"我想在后台运行：{cmd}，可以吗？", cmd)[0])  # nobody answers
+        q = [d for k, d in self.events if k == "ask"][0]["question"]
+        self.assertTrue(q.startswith("会另开一个 Claude，它给别的会话发消息不会再问你："), q)
+        self.cfg.transparent = False
+        self.cfg.permissions["background_job"] = "allow"  # "allow" for jobs is not "allow" for another Claude
+        self.events.clear()
+        self.assertFalse(self.sb.gate(line.id, "background_job", "q", cmd)[0])
+        self.assertEqual(len([k for k, d in self.events if k == "ask"]), 1)
+        self.cfg.permissions["send_to_session"] = "deny"
+        ok, why = self.sb.gate(line.id, "codex_shell", "Codex 想在沙箱外运行命令，可以吗？", cmd, {"kind": "shell", "command": cmd})
+        self.assertFalse(ok)
+        self.assertIn("发消息给别的 Claude 会话", why)
+        self.assertEqual(self.sb.gate(line.id, "background_job", "我想在后台运行：dir，可以吗？", "dir"), (True, ""))  # others as set
+        self.assertEqual(self.sb.gate(line.id, "background_job", "要停掉后台任务 j1（claude -p x），可以吗？"), (True, ""))  # stopping one
+
+    def _records(self):
+        mock.patch.object(paths, "RECORDS_DIR", self.tmp / "records").start()
+        self.sb.switch_to_project("Atlas")
+        return self.sb.active()
+
+    def test_a_project_line_records_through_its_tool(self):
+        line = self._records()
+        line.turns_since_record = 3
+        r = self.sb.control_request(line.id, "record", {"what": "改了引言", "why": "太长", "how": "拆成两段"})
+        self.assertTrue(r["ok"], r)
+        self.assertIn("第 1 条", r["message"])
+        self.assertEqual(line.turns_since_record, 0)
+        self.assertIn("## 1. 改了引言", records.path_for("Atlas", line.id.removeprefix("p-")).read_text("utf-8"))
+        self.assertFalse(self.sb.control_request(MANAGER, "record", {"what": "x", "why": "y", "how": "z"})["ok"])
+        self.assertFalse(self.sb.control_request(line.id, "record", {"what": "x"})["ok"])  # parts missing
+
+    def test_a_line_left_after_a_topic_is_nudged_quietly_once(self):
+        line = self._records()
+        self.sb.say(line.id, "一")
+        line.on_session("done", {"status": "ok", "message": "好"})
+        self.sb.say(line.id, "二")
+        line.on_session("done", {"status": "ok", "message": "好"})
+        self.assertEqual(line.turns_since_record, 2)
+        sent = len(line.session.sent)
+        self.sb.switch(MANAGER)  # the user leaves the topic
+        self.assertEqual(len(line.session.sent), sent + 1)
+        self.assertIn("record", line.session.sent[-1])
+        self.assertTrue(line.quiet)
+        # the quiet turn: nothing of it is shown, said or kept as news
+        self.events.clear()
+        line.on_session("text", "已记")
+        line.on_session("done", {"status": "ok", "message": "已记"})
+        self.assertFalse(line.quiet)
+        self.assertEqual([k for k, d in self.events if k in ("text", "done", "notice")], [])
+        self.assertEqual(line.unread(), [])
+        self.sb.switch(line.id)
+        self.sb.switch(MANAGER)
+        self.assertEqual(len(line.session.sent), sent + 1)  # asked once per topic, not on every switch
+
+    def test_a_quiet_turn_that_never_ends_does_not_silence_the_line(self):
+        """The process exits (or the brake is pulled) during a nudge: the user's next turn is heard and shown."""
+        line = self._records()
+        for end in ("exit", "brake"):
+            line.state, line.turns_since_record, line.record_asked = "idle", 2, False
+            self.assertTrue(line.nudge("记一条"))
+            if end == "exit":
+                line.on_session("exit", 1)
+                line.state = "idle"  # reconnected
+            else:
+                line.kill_and_resume()
+            self.assertFalse(line.quiet)
+            self.events.clear()
+            self.sb.say(line.id, "三")
+            line.on_session("text", "这是对三的回答")
+            line.on_session("done", {"status": "ok", "message": "这是对三的回答"})
+            self.assertEqual([k for k, d in self.events if k in ("text", "done")], ["text", "done"], end)
+
+    def test_a_nudge_keeps_the_next_sentence_one_turn_for_a_rewind(self):
+        line = self._records()
+        self.sb.say(line.id, "二")
+        line.on_session("mark", {"prompt": "u2-prompt", "last": "u2-prompt"})
+        line.on_session("mark", {"last": "u2-last"})
+        line.on_session("done", {"status": "ok", "message": "好"})
+        line.turns_since_record = 2
+        self.sb.switch(MANAGER)  # nudged
+        line.on_session("mark", {"prompt": "nudge-prompt", "last": "nudge-last"})
+        line.on_session("done", {"status": "ok", "message": ""})
+        self.assertEqual((line.turn_log[-1]["prompt"], line.turn_log[-1]["last"]), ("u2-prompt", "nudge-last"))
+        self.assertTrue(line.turn_log[-1]["quiet_after"])  # rewinding 二 now takes the nudge too: two turns
+
+    def test_one_nudge_for_one_switch_even_if_the_user_speaks_meanwhile(self):
+        line = self._records()
+        line.turns_since_record, line.pending_model = 2, "sonnet"
+        self.sb._apply_pending(line)
+        nudges = sum("record" in x for x in line.session.sent)
+        self.sb.say(line.id, "三")  # during the nudge
+        line.on_session("done", {"status": "ok", "message": ""})  # the nudge's end
+        line.on_session("done", {"status": "ok", "message": "对三的回答"})  # the user's turn
+        self.assertEqual(sum("record" in x for x in line.session.sent), nudges)
+        self.assertIn(("restart", "sonnet"), line.session.calls)
+
+    def test_one_turn_is_no_topic(self):
+        line = self._records()
+        self.sb.say(line.id, "一")
+        line.on_session("done", {"status": "ok", "message": "好"})
+        sent = len(line.session.sent)
+        self.sb.switch(MANAGER)
+        self.assertEqual(len(line.session.sent), sent)
+
+    def test_a_model_switch_waits_for_the_record(self):
+        line = self._records()
+        line.turns_since_record = 2
+        line.pending_model = "sonnet"
+        self.sb._apply_pending(line)
+        self.assertNotIn(("restart", "sonnet"), line.session.calls)  # the old model records first
+        self.assertTrue(line.quiet)
+        line.on_session("done", {"status": "ok", "message": ""})
+        self.assertIn(("restart", "sonnet"), line.session.calls)  # then the switch
+
+    def test_an_idle_line_writes_its_record_before_it_is_closed(self):
+        line = self._records()
+        self.sb.switch(MANAGER)
+        line.turns_since_record, line.record_asked = 2, False
+        self.clock[0] += self.sb.idle_seconds + 1
+        self.sb.tick()
+        self.assertNotEqual(line.state, "closed")
+        self.assertTrue(line.quiet)
+        line.on_session("done", {"status": "ok", "message": ""})
+        self.sb.tick()
+        self.assertEqual(line.state, "closed")
+
+    def test_the_records_go_into_the_prompt(self):
+        line = self._records()
+        self.sb.control_request(line.id, "record", {"what": "D1 同意", "why": "主模型合适", "how": "按 N=262 的模型"})
+        prompt = self.sb._line_prompt(line)
+        self.assertIn("这个项目之前的记录", prompt)
+        self.assertIn("D1 同意", prompt)
+        self.assertIn(str(records.path_for("Atlas", line.id.removeprefix("p-"))), prompt)
+        from voiceclaude import prompts
+        self.assertIn("record", prompts.RECORD_RULE)
+        self.assertNotIn("record 工具", prompts.SCRATCH_PROMPT)
+        self.assertNotIn("record 工具", prompts.manager_prompt(""))
+        self.assertIn("12. 你是“杂项”线", prompts.SCRATCH_PROMPT)
+        line.session.system_prompt = "old"
+        self.sb._fresh_prompt(line)  # before a restart: the records as they are now
+        self.assertIn("D1 同意", line.session.system_prompt)
+
+    def test_shutdown_lets_lines_record_first(self):
+        line = self._records()
+        line.turns_since_record = 2
+        self.sb.SHUTDOWN_RECORD_WAIT = 0.3
+        t0 = time.monotonic()
+        self.sb.shutdown()  # the fake never finishes its turn: the wait is bounded
+        self.assertTrue(any("record" in x for x in line.session.sent))
+        self.assertLess(time.monotonic() - t0, 2)
+
+    def _board(self):
+        from voiceclaude import board
+        self.sb.boards = board.Boards(self.tmp / "boards")
+        self.sb.switch_to_project("Atlas")
+        return self.sb.active(), self.sb.active().id.removeprefix("p-")
+
+    def test_the_board_tools_put_things_on_the_projects_board(self):
+        line, key = self._board()
+        r = self.sb.control_request(line.id, "board_show", {"kind": "text", "content": "D6 按 FDA 批准药物", "title": "D6"})
+        self.assertTrue(r["ok"], r)
+        self.assertIn("白板现在没开", r["message"])
+        scene = self.sb.boards.scene(key)[0]
+        self.assertEqual([e["type"] for e in scene["elements"]], ["rectangle", "text", "text"])
+        r2 = self.sb.control_request(line.id, "board_show", {"kind": "shape", "shape": "arrow", "content": "然后",
+                                                             "near_id": r["ids"][0]})
+        arrow = next(e for e in self.sb.boards.scene(key)[0]["elements"] if e["type"] == "arrow")
+        box = scene["elements"][0]
+        self.assertGreaterEqual(arrow["x"], box["x"] + box["width"])  # to the right of the card
+        self.assertFalse(self.sb.control_request(line.id, "board_show", {"kind": "image", "path": str(self.tmp / "none.png")})["ok"])
+        self.assertFalse(self.sb.control_request(line.id, "board_show", {"kind": "table"})["ok"])
+        self.assertFalse(self.sb.control_request(MANAGER, "board_show", {"kind": "text", "content": "x"})["ok"])
+
+    def test_looking_at_a_closed_board_says_so_and_lists_its_text(self):
+        line, key = self._board()
+        self.sb.control_request(line.id, "board_show", {"kind": "text", "content": "第一张卡"})
+        self.events.clear()
+        r = self.sb.control_request(line.id, "board_look", {})
+        self.assertFalse(r["ok"])
+        self.assertIn("白板没开", r["message"])
+        self.assertIn("1. 第一张卡", r["message"])
+        self.assertIn(("board", {"line": line.id, "want": "look"}), self.events)  # the window may offer to open it
+
+    def test_a_window_on_another_projects_board_is_named(self):
+        """The window shows Beacon's board (opened while Beacon was in front); Atlas's line asks: it is told which
+        board is open, not just "白板没开"."""
+        from voiceclaude import board
+        self.sb.boards = board.Boards(self.tmp / "boards")
+        self.sb.switch_to_project("Beacon")
+        beacon = self.sb.active()
+        self.sb.switch_to_project("Atlas")
+        line, key = self.sb.active(), self.sb.active().id.removeprefix("p-")
+        self.sb.boards.last_poll[beacon.id.removeprefix("p-")] = self.sb.boards.now()
+        r = self.sb.control_request(line.id, "board_show", {"kind": "text", "content": "一"})
+        self.assertTrue(r["ok"], r)
+        self.assertIn(f"开着的白板窗口是「{beacon.name}」的白板，不是这个项目的", r["message"])
+        r = self.sb.control_request(line.id, "board_look", {})
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["message"].startswith(f"开着的白板窗口是「{beacon.name}」的白板"), r["message"])
+        self.assertIn("1. 一", r["message"])
+        # its own board open but the page does not answer in time: not "白板没开"
+        self.sb.boards.last_poll[key] = self.sb.boards.now()
+        with mock.patch.object(self.sb.boards, "snapshot", lambda k: None):
+            r = self.sb.control_request(line.id, "board_look", {})
+        self.assertTrue(r["message"].startswith("白板开着，但页面这次没有交回截图"), r["message"])
+
+    def test_looking_at_an_open_board(self):
+        import base64
+        line, key = self._board()
+        self.sb.boards.last_poll[key] = self.sb.boards.now()
+
+        def page():
+            ev = self.sb.boards.wait_events(key, 0, wait=3)
+            req = next(e for e in ev["events"] if e["kind"] == "snapshot")["request"]
+            self.sb.boards.store_snapshot(key, req, base64.b64encode(b"\x89PNG fake").decode(), ["用户画了一个圈", "写着：这里不对"])
+
+        t = threading.Thread(target=page)
+        t.start()
+        r = self.sb.control_request(line.id, "board_look", {})
+        t.join()
+        self.assertTrue(r["ok"], r)
+        self.assertIn("用 Read 打开看图", r["message"])
+        self.assertIn("2. 写着：这里不对", r["message"])
+
+    def test_clearing_the_board_is_asked(self):
+        line, key = self._board()
+        self.sb.control_request(line.id, "board_show", {"kind": "text", "content": "一"})
+        self.cfg.transparent = True  # asked all the same: it deletes
+        self.events.clear()
+        r = self.sb.control_request(line.id, "board_clear", {})  # nobody answers
+        self.assertFalse(r["ok"])
+        self.assertTrue([d for k, d in self.events if k == "ask"][0]["question"].startswith("删除"))
+        self.assertTrue(self.sb.boards.scene(key)[0]["elements"])
+        self.events.clear()
+        self._answer_asks(True)
+        r = self.sb.control_request(line.id, "board_clear", {})
+        self.assertTrue(r["ok"], r)
+        self.assertIn("备份", r["message"])
+        self.assertEqual(self.sb.boards.scene(key)[0]["elements"], [])
+
+    def test_the_users_look_reaches_the_boards_project_line(self):
+        line, key = self._board()
+        snap = {"png": str(self.tmp / "boards" / "k-1.png"), "txt": str(self.tmp / "boards" / "k-1.txt"), "texts": ["这里不对"]}
+        self.sb.board_shown_by_user(key, snap)
+        said = line.session.sent[-1]
+        self.assertIn(snap["png"], said)
+        self.assertIn("1. 这里不对", said)
+        self.assertIn("让它看", said)
+        # from the manager: the board's own project is put in front, then told
+        self.sb.switch(MANAGER)
+        line.on_session("done", {"status": "ok", "message": "好"})
+        self.sb.board_shown_by_user(key, snap)
+        self.assertEqual(self.sb.active_id, line.id)
+        self.assertIn(snap["png"], line.session.sent[-1])
+        self.events.clear()
+        self.sb.board_shown_by_user("00000000", snap)  # a board whose project is not known
+        self.assertIn("这块白板的项目找不到了，白板没有交出去。", self.notices())
+
+    def test_the_board_rule_is_for_project_lines(self):
+        from voiceclaude import prompts
+        self.assertIn("board_show", prompts.PROJECT_PROMPT)
+        self.assertNotIn("board_show", prompts.SCRATCH_PROMPT)
+        self.assertNotIn("board_show", prompts.manager_prompt(""))
+
+    def test_codex_lines_are_not_told_to_relay(self):
+        from voiceclaude import prompts
+        self.assertIn("SendMessage", prompts.PROJECT_PROMPT)
+        for p in (prompts.PROJECT_PROMPT, prompts.SCRATCH_PROMPT):
+            c = prompts.for_codex(p)
+            self.assertNotIn("SendMessage", c)  # Codex has no SendMessage: telling it how would push it to `claude -p`
+            self.assertIn("这条线不能把话转给", c)
+
+    def test_claude_lines_get_the_gate(self):
+        from voiceclaude import access
+        mock.patch.object(access, "detect", lambda cmd: access.AccessStatus(True, "subscription", "测试")).start()
+        self.sb.switch_to_project("Atlas")
+        line = self.sb.active()
+        s = self.sb._claude_session(line, "")
+        self.assertIsNotNone(s.tool_gate)
+        with mock.patch.object(self.sb, "gate_tool", lambda *a: ("called", a)):
+            self.assertEqual(s.tool_gate("SendMessage", {"to": "x"}, "tu"), ("called", (line.id, "SendMessage", {"to": "x"}, "tu")))
 
     def test_transparent_phrases_and_tool(self):
         self.sb.switch_to_project("Atlas")

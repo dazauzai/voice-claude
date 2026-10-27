@@ -111,6 +111,7 @@ class ExitPhraseTests(unittest.TestCase):
                  "进入后台模式。": "background_mode", "后台怎么样了？": "background_status",
                  "关掉后台服务": "shutdown_daemon", "撤销排队。": "cancel_queue", "刚才的别发了": "cancel_queue",
                  "打开接入页。": "open_access", "打开 AI 服务商。": "open_access", "A I 服务商": "open_access",
+                 "打开白板。": "open_board", "帮我开白板": "open_board",
                  "打开通透模式。": "transparent_on", "开启通透模式": "transparent_on", "请关闭通透模式": "transparent_off",
                  "退出通透模式。": "transparent_off"}
         for text, key in cases.items():

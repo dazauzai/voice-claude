@@ -1,0 +1,3 @@
+/* esm.sh - @radix-ui/react-use-escape-keydown@1.1.0 */
+import*as n from"react";import{useCallbackRef as s}from"../../react-use-callback-ref@1.1.0/xZXJlYW/react-use-callback-ref.mjs";function p(r,e=globalThis?.document){let t=s(r);n.useEffect(()=>{let a=o=>{o.key==="Escape"&&t(o)};return e.addEventListener("keydown",a,{capture:!0}),()=>e.removeEventListener("keydown",a,{capture:!0})},[t,e])}export{p as useEscapeKeydown};
+//# sourceMappingURL=react-use-escape-keydown.mjs.map

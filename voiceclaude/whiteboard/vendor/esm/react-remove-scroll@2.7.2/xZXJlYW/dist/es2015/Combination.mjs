@@ -1,0 +1,3 @@
+/* esm.sh - react-remove-scroll@2.7.2/dist/es2015/Combination */
+import{__assign as m}from"../../../../tslib@_2.1.0/index.mjs";import*as e from"react";import{RemoveScroll as r}from"./UI.mjs";import c from"./sidecar.mjs";var a=e.forwardRef(function(o,t){return e.createElement(r,m({},o,{ref:t,sideCar:c}))});a.classNames=r.classNames;var l=a;export{l as default};
+//# sourceMappingURL=Combination.mjs.map

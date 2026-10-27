@@ -98,6 +98,11 @@ class DaemonClient:
     def interrupt(self, line: str) -> dict:
         return self._call("interrupt", line=line)
 
+    def usage(self) -> dict:
+        """Token use and quotas: ok, today / since_start ({provider: totals}), limits ({provider: snapshot or None}),
+        last_turn ({line: its latest usage event})."""
+        return self._call("usage")
+
     def rewind(self, line: str = "", turn: str | None = None, steps: int = 1) -> dict:
         """Back to just before a sentence: `turn` (from say's reply) and everything after it, or the last `steps`
         user turns. May ask out loud whether to put changed files back, so it can take a while: call it off the UI

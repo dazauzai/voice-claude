@@ -332,8 +332,106 @@ def _process_image(hwnd: int) -> str:
         return ""
 
 
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260)]
+
+
+def _processes() -> list[tuple[int, int, str]]:
+    """Every process as (pid, parent pid, program file in lower case); [] when the list cannot be read."""
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k.Process32FirstW.argtypes = k.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        snap = k.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return []
+        try:
+            e, out = _PROCESSENTRY32W(), []
+            e.dwSize = ctypes.sizeof(e)
+            ok = k.Process32FirstW(snap, ctypes.byref(e))
+            while ok:
+                out.append((int(e.th32ProcessID), int(e.th32ParentProcessID), e.szExeFile.lower()))
+                ok = k.Process32NextW(snap, ctypes.byref(e))
+            return out
+        finally:
+            k.CloseHandle(snap)
+    except Exception:
+        return []
+
+
+# under these a claude.exe is not one started from a shell: the desktop app's own processes and sessions (the app is
+# the claude.exe with claude.exe children), voice-claude's lines
+_NOT_CLAUDES_PARENT = {"claude.exe", "python.exe", "pythonw.exe"}
+
+
+def runs_claude(hwnd: int, image: str | None = None) -> bool:
+    """Does a Claude session run in this window? Words typed and sent there go to that session.
+    - The Claude desktop app itself (its Code-tab sessions take what is typed there).
+    - A terminal or an editor with Claude Code running in it: under its process, or as the process a console window
+      belongs to (claude started straight from Win+R or a shortcut: conhost <- claude.exe).
+    - A terminal with WSL in it (what runs inside cannot be seen from here: asked rather than missed).
+    - Any terminal while Claude Code started from a shell runs somewhere (tabs and a console handed over to Windows
+      Terminal do not show whose they are). Not the desktop app's own sessions, nor voice-claude's lines.
+    Never by what runs under Explorer (it starts the desktop app, the taskbar and the Run box are its windows)."""
+    procs = _processes()
+    names = {p: name for p, _, name in procs}
+    parent = {p: pp for p, pp, _ in procs}
+    pid = _pid(hwnd)
+    image = ((_process_image(hwnd) if image is None else image) or names.get(pid, "")).lower()
+    if image == "claude.exe":
+        return True
+    if image and not risk.hosts_commands(image):
+        return False  # Explorer, a browser, Word: not where Claude Code runs (an unreadable program is looked into)
+    roots = {pid} | ({parent.get(pid, 0)} if image in ("conhost.exe", "openconsole.exe") else set())
+    roots.discard(0)
+    if any(names.get(r) == "claude.exe" for r in roots):
+        return True
+    children: dict[int, list[int]] = {}
+    for p, pp, _ in procs:
+        children.setdefault(pp, []).append(p)
+    seen, todo = set(roots), list(roots)
+    while todo:
+        for p in children.get(todo.pop(), []):
+            if p in seen:
+                continue
+            if names.get(p) in ("claude.exe", "wsl.exe", "wslhost.exe"):
+                return True
+            seen.add(p)
+            todo.append(p)
+    if image in risk.TERMINAL_IMAGES:
+        app = {pp for p, pp, name in procs if name == "claude.exe" and names.get(pp) == "claude.exe"}  # the desktop app
+        return any(name == "claude.exe" and p not in app and names.get(parent.get(p, 0), "") not in _NOT_CLAUDES_PARENT
+                   for p, _, name in procs)
+    return False
+
+
+def unasked_session(hwnd: int, facts: dict) -> str:
+    """Checked when a step acts: the window it lands in runs a Claude session but the step was not asked as a message
+    to it (the window came up later, say, after Win+R or a click): not done, so it is asked on its own."""
+    if facts.get("session") or not hwnd or not runs_claude(hwnd):
+        return ""
+    return (NOT_DONE + "前台是一个 Claude 会话的窗口，在里面打字、按键或点击都会交给它，这一步要单独问用户。"
+            "把这一步单独再调用一次（不要放在 run_steps 里）。")
+
+
+def window_facts(hwnd: int) -> dict:
+    """What the permission check knows about the window a step acts in: its program, and whether a Claude session
+    runs there (typing into it is asked like a message to that session)."""
+    if not hwnd:
+        return {}
+    image = _process_image(hwnd)  # '' when it cannot be read (an elevated window): looked into all the same
+    return {"program": image, "session": runs_claude(hwnd, image)}
+
+
 def _window_at(x: int, y: int) -> int:
-    """The top-level window under a screen point."""
+    """The top-level window under a screen point (none in a unit test: the real desktop is not read)."""
+    if testing.under_test_runner():
+        return 0
     try:
         h = int(_u32().WindowFromPoint(wintypes.POINT(x, y)) or 0)
         return _root(h) or h
@@ -349,13 +447,88 @@ def _frontend_pid() -> int:
         return 0
 
 
+VOICE_TITLE = re.compile(r"(?:^|[\u2014\u2013-]\s*)voice-claude\s*$", re.I)  # "论文 — voice-claude"
+
+
+def _title(hwnd: int) -> str:
+    try:
+        u = ctypes.windll.user32
+        n = u.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        u.GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value.strip()
+    except Exception:
+        return ""
+
+
+def _class(hwnd: int) -> str:
+    try:
+        buf = ctypes.create_unicode_buffer(64)
+        ctypes.windll.user32.GetClassNameW(hwnd, buf, 64)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def is_voice_window(hwnd: int) -> bool:
+    """A voice-claude window of any copy (the user may run two): a Tk window titled "... — voice-claude"."""
+    return bool(hwnd) and _class(hwnd) == "TkTopLevel" and bool(VOICE_TITLE.search(_title(hwnd)))
+
+
 def is_frontend(hwnd: int, pid: int | None = None) -> bool:
-    """Is it the voice-claude window? Keys typed there count as the user's own words (answers to request cards,
+    """Is it a voice-claude window? Keys typed there count as the user's own words (answers to request cards,
     fixed phrases, new sentences), so the desktop tools never type, press keys or click into it."""
     if not hwnd:
         return False
     pid = _frontend_pid() if pid is None else pid
-    return bool(pid) and _pid(hwnd) == pid
+    return (bool(pid) and _pid(hwnd) == pid) or is_voice_window(hwnd)
+
+
+_SHELL_CLASSES = {"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW"}  # the taskbar and the desktop
+
+
+def _z_order() -> list[int]:
+    """Every top-level window, top to bottom (EnumWindows' order); empty when they cannot be listed, and in a unit
+    test (the real desktop is not read)."""
+    if testing.under_test_runner():
+        return []
+    out: list[int] = []
+    try:
+        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(lambda h, _: out.append(int(h or 0)) or True)
+        ctypes.windll.user32.EnumWindows(proc, 0)
+    except Exception:
+        log.debug("could not list the windows", exc_info=True)
+    return out
+
+
+def _ex_style(hwnd: int) -> int:
+    try:
+        return int(ctypes.windll.user32.GetWindowLongW(hwnd, -20))  # GWL_EXSTYLE
+    except Exception:
+        return 0
+
+
+def _shown(hwnd: int) -> bool:
+    """A window the user works in: visible, not minimised, not a tool window (a floating palette), not cloaked (on
+    another virtual desktop), not the taskbar or the desktop."""
+    try:
+        u = ctypes.windll.user32
+        if not u.IsWindowVisible(hwnd) or u.IsIconic(hwnd) or _class(hwnd) in _SHELL_CLASSES or _ex_style(hwnd) & 0x80:
+            return False
+        cloaked = wintypes.DWORD(0)
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(wintypes.HWND(hwnd), 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+        return not cloaked.value  # DWMWA_CLOAKED
+    except Exception:
+        return False
+
+
+def window_behind_ours() -> "Window | None":
+    """The window the user was in before ours came to the front (they spoke to it, or answered a card): the first
+    shown, titled window down the z-order that is not ours. A normal window comes before an always-on-top one (ours is
+    always on top, and so are overlays nobody works in). None when there is none."""
+    pid = _frontend_pid()
+    found = [Window(h, t) for h in _z_order() if h and not is_frontend(h, pid) and _shown(h) and (t := _title(h))]
+    return next((w for w in found if not _ex_style(w.hwnd) & 0x8), found[0] if found else None)  # WS_EX_TOPMOST
 
 
 FRONTEND_REFUSAL = "那是 voice-claude 自己的窗口：在那里输入、按键或点击等于替用户说话，没有执行。先让用户切到要操作的窗口。"
@@ -622,6 +795,113 @@ def _send_unicode(text: str, guard: Callable[[], bool] | None = None) -> None:
         time.sleep(0.01)
 
 
+# ---------- the clipboard: long or several-line text goes in by one paste ----------
+
+PASTE_OVER = 300  # characters; and any text of several lines, into anything that is not a terminal
+CF_UNICODETEXT = 13
+
+
+def _clipboard_api():
+    u, k = ctypes.WinDLL("user32", use_last_error=True), ctypes.WinDLL("kernel32", use_last_error=True)
+    u.OpenClipboard.argtypes = [wintypes.HWND]
+    u.GetClipboardData.argtypes = [wintypes.UINT]
+    u.GetClipboardData.restype = wintypes.HANDLE
+    u.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    u.SetClipboardData.restype = wintypes.HANDLE
+    u.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+    k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k.GlobalAlloc.restype = wintypes.HGLOBAL
+    k.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k.GlobalLock.restype = ctypes.c_void_p
+    k.GlobalUnlock.argtypes = k.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    return u, k
+
+
+def _open_clipboard(u) -> bool:
+    for _ in range(20):  # another program may hold it for a moment
+        if u.OpenClipboard(None):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def clipboard_text() -> str | None:
+    """The text on the clipboard now, or None (empty, not text, or not readable)."""
+    try:
+        u, k = _clipboard_api()
+        if not u.IsClipboardFormatAvailable(CF_UNICODETEXT) or not _open_clipboard(u):
+            return None
+        try:
+            h = u.GetClipboardData(CF_UNICODETEXT)
+            ptr = k.GlobalLock(h) if h else None
+            if not ptr:
+                return None
+            try:
+                return ctypes.wstring_at(ptr)
+            finally:
+                k.GlobalUnlock(h)
+        finally:
+            u.CloseClipboard()
+    except Exception:
+        return None
+
+
+def set_clipboard_text(text: str) -> None:
+    u, k = _clipboard_api()
+    data = ctypes.create_unicode_buffer(text)
+    if not _open_clipboard(u):
+        raise OSError("剪贴板被别的程序占着")
+    try:
+        u.EmptyClipboard()
+        h = k.GlobalAlloc(0x0002, ctypes.sizeof(data))  # GMEM_MOVEABLE
+        ptr = k.GlobalLock(h) if h else None
+        if not ptr:
+            raise OSError("剪贴板写不进去")
+        ctypes.memmove(ptr, data, ctypes.sizeof(data))
+        k.GlobalUnlock(h)
+        if not u.SetClipboardData(CF_UNICODETEXT, h):
+            k.GlobalFree(h)
+            raise OSError("剪贴板写不进去")
+    finally:
+        u.CloseClipboard()
+
+
+def pastes(text: str, window: str = "", program: str = "") -> bool:
+    """Should this text go in by one paste instead of key by key? Long text (typing it takes long, and a change of
+    window half way cuts it off), and text of several lines into anything that is not a terminal: typed, every line
+    break is an Enter, which in a chat box sends what is there so far. In a terminal a line break runs the line, so
+    there it is typed as before."""
+    terminal = (program or "").lower() in risk.TERMINAL_IMAGES or bool(risk.TERMINAL.search(window or ""))
+    return not terminal and (len(text) > PASTE_OVER or "\n" in text.rstrip("\n"))
+
+
+def _paste(text: str, same_window: Callable[[], bool]) -> str:
+    """Put the text in with one Ctrl+V (line breaks stay line breaks), then the Enter of any line breaks at its end
+    (typed text keeps its meaning: "...\n" ends with Enter). The clipboard's earlier text is put back afterwards."""
+    body = text.rstrip("\n")
+    enters = len(text) - len(body)
+    before = clipboard_text()
+    set_clipboard_text(body.replace("\r\n", "\n").replace("\n", "\r\n"))
+    try:
+        _fail_safe_check()
+        if not same_window():
+            raise TypingStopped(0)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.3)  # the window takes it from the clipboard in its own time
+        for _ in range(enters):
+            if not same_window():
+                break
+            pyautogui.press("enter")
+    finally:
+        if before is not None:
+            time.sleep(0.7)
+            try:
+                set_clipboard_text(before)
+            except OSError:
+                log.warning("could not put the clipboard's text back")
+    return f"已粘贴 {len(body)} 个字{'，然后按了回车' if enters else ''}。"
+
+
 def _guard(fn: Callable[[], Any]):
     """Turn pyautogui's fail-safe and other errors into a sentence for Claude."""
     try:
@@ -647,18 +927,81 @@ class Plan:
     window: Window | None = None  # type / keys: the window it was announced for, shared with the steps after it
 
 
+def own_windows() -> list[tuple[int, int, int, int]]:
+    """voice-claude's own windows on the screen (physical pixels: left, top, width, height), largest first: the titled,
+    visible, not minimised top-level windows of the window's process, and any other copy's (by title)."""
+    pid = _frontend_pid()
+    out = []
+    try:
+        u, dwm = ctypes.windll.user32, ctypes.windll.dwmapi
+        for h in _all_windows():
+            if not u.IsWindowVisible(h) or u.IsIconic(h):
+                continue
+            if not ((pid and _pid(h) == pid and _title(h)) or is_voice_window(h)):
+                continue  # (an untitled window of ours is a tooltip or a menu)
+            r = wintypes.RECT()
+            # the frame as drawn (GetWindowRect also counts the invisible resize borders)
+            if dwm.DwmGetWindowAttribute(wintypes.HWND(h), 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
+                u.GetWindowRect(wintypes.HWND(h), ctypes.byref(r))
+            w, hh = r.right - r.left, r.bottom - r.top
+            if w >= 40 and hh >= 20:
+                out.append((r.left, r.top, w, hh))
+    except Exception:
+        log.debug("could not find our own window", exc_info=True)
+    return sorted(set(out), key=lambda r: r[2] * r[3], reverse=True)
+
+
+OWN_BOX = (255, 140, 0)  # the orange frame drawn round our own windows in a screenshot
+NOT_MARKED = "这张截图里没有标出语音助手的窗口（最小化、在别的屏幕或没找到）。"
+MOVING = "语音助手的窗口正在移动，这张截图里没有标出它。"
+
+
+def mark_own_windows(img, scale: float, rects: list[tuple[int, int, int, int]]) -> str:
+    """Frame voice-claude's own windows on the (shrunk) screenshot and say where they are: what they show is this
+    line's own conversation or status, never the state of the window it is working on. '' when none is on it."""
+    places = []
+    try:
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(img)
+        for rect in rects:
+            x0, y0 = max(0, rect[0]), max(0, rect[1])
+            x1, y1 = min(int(img.size[0] * scale), rect[0] + rect[2]), min(int(img.size[1] * scale), rect[1] + rect[3])
+            if x1 <= x0 or y1 <= y0:
+                continue  # on another screen
+            box = [int(x0 / scale), int(y0 / scale), int(x1 / scale) - 1, int(y1 / scale) - 1]
+            draw.rectangle(box, outline=OWN_BOX, width=3)
+            draw.text((box[0] + 6, box[1] + 4), "voice-claude", fill=OWN_BOX)
+            places.append(f"({box[0]}, {box[1]}) 起、宽 {box[2] - box[0] + 1} 高 {box[3] - box[1] + 1}")
+    except Exception:
+        log.exception("could not mark our own window")
+        return ""
+    if not places:
+        return ""
+    return (f"语音助手自己的窗口在 {'；'.join(places)}（截图坐标，图上用橙色框标出）：那是语音助手自己的对话或状态，"
+            "不是对方窗口的内容，不能当作对方的状态或已经发出去的证据。")
+
+
 def plan_screenshot() -> Plan:
     def go():
+        before = own_windows()
         img = pyautogui.screenshot()
+        after = own_windows()
+        if before != after:  # it was moving (it shrinks to a corner when desktop steps begin): once more
+            time.sleep(0.3)
+            before = own_windows()
+            img = pyautogui.screenshot()
+            after = own_windows()
         w, h = img.size
         s = shot_scale()
         if s > 1.0:
             img = img.resize((int(w / s), int(h / s)))
+        img = img.convert("RGB")
+        own = MOVING if before != after else (mark_own_windows(img, s, after) or NOT_MARKED)
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, "JPEG", quality=70)
+        img.save(buf, "JPEG", quality=70)
         log.info("screenshot %dx%d -> %dx%d, %d bytes", w, h, *img.size, buf.tell())
-        return [f"屏幕 {w}x{h}，这张图缩小为 {img.size[0]}x{img.size[1]}；点击坐标请按图上的像素给。前台窗口：{active_window() or '（无）'}。",
-                Image(data=buf.getvalue(), format="jpeg")]
+        return [f"屏幕 {w}x{h}，这张图缩小为 {img.size[0]}x{img.size[1]}；点击坐标请按图上的像素给。前台窗口：{active_window() or '（无）'}。"
+                + (own and " " + own), Image(data=buf.getvalue(), format="jpeg")]
     return Plan("screenshot", "看一眼屏幕", "", go, {"kind": "screenshot"})
 
 
@@ -671,18 +1014,26 @@ def plan_click(x: int, y: int, target: str, button: str = "left", double: bool =
     if is_frontend(_window_at(*to_screen(x, y))):
         return FRONTEND_REFUSAL  # its 可以 button answers a request: never clicked for the user
 
+    facts = {"kind": "click", "target": target.strip(), "window": announced, **window_facts(_window_at(*to_screen(x, y)))}
+
     def go():
         why = replace_prompt_popped(announced)
         if why:
             return why
         if is_frontend(_window_at(*to_screen(x, y))):
             return NOT_DONE + FRONTEND_REFUSAL
+        why = unasked_session(_window_at(*to_screen(x, y)), facts)
+        if why:
+            return why
         if run is not None:
             run.windows = _all_windows()
         sx, sy = to_screen(x, y)
         pyautogui.click(sx, sy, clicks=2 if double else 1, button=button)
         return f"已{what}（屏幕坐标 {sx}, {sy}）。"
-    return Plan("click", what, f"坐标 ({x}, {y})", go, {"kind": "click", "target": target.strip(), "window": announced})
+    hit = _window_at(*to_screen(x, y))
+    # in run_steps, typing and keys after a click go to the window the click lands in (not to what is in front now,
+    # which may be ours: the user just spoke to it)
+    return Plan("click", what, f"坐标 ({x}, {y})", go, facts, window=Window(hit, _title(hit)) if hit else None)
 
 
 def plan_type(text: str, window: Window | None = None, run: Run | None = None, follows: bool = False) -> Plan | str:
@@ -690,8 +1041,12 @@ def plan_type(text: str, window: Window | None = None, run: Run | None = None, f
         return "没有要输入的文字。"
     w = window or current_window()
     if not w.pending and is_frontend(w.hwnd):
-        return FRONTEND_REFUSAL
-    facts = {"kind": "type", "text": text, "window": w.title}
+        # ours is in front because the user just spoke to it: the window they were in before is meant (it is named in
+        # the request, and brought back in front before anything is typed). Never ours.
+        w = (window_behind_ours() if window is None else None) or w
+        if is_frontend(w.hwnd):
+            return FRONTEND_REFUSAL
+    facts = {"kind": "type", "text": text, "window": w.title, **window_facts(w.hwnd)}
     if w.hwnd and risk.SAVE_DIALOG.search(w.title or "") and not risk.in_replace_dialog(w.title):
         folder = dialog_folder(w.hwnd)  # so a bare name that exists there is asked about in 通透模式
         if folder:
@@ -702,11 +1057,16 @@ def plan_type(text: str, window: Window | None = None, run: Run | None = None, f
         if why:
             return why
         target, pid = _fg_hwnd(), _frontend_pid()
+        why = unasked_session(target, facts)
+        if why:
+            return why
 
         def same_window() -> bool:  # checked before every character: the rest must not land anywhere else
             now = _fg_hwnd()
             return now == target and not (pid and _pid(now) == pid)
         try:
+            if pastes(text, w.title, facts.get("program", "")):
+                return _paste(text, same_window)
             _send_unicode(text, same_window)
         except TypingStopped as s:
             return (f"{NOT_DONE}输入到一半前台窗口变了（已输入 {s.typed} 个字，其余的没有输入）。"
@@ -732,7 +1092,10 @@ def shell_shortcut(keys: list[str]) -> bool:
 
 # Shortcuts that bring up a window of their own: what follows them in a run goes there.
 OPENERS = [{"win"}, {"ctrl", "esc"}, {"ctrl", "shift", "esc"}, {"win", "tab"}, {"win", "shift", "s"}, {"printscreen"}] \
-    + [{"win", c} for c in "reixsanvkpucwg123456789"]
+    + [{"win", c} for c in "reixsankpucwg123456789"]
+# Shortcuts whose panel puts something into the window behind it (clipboard history, emoji): that window is where the
+# steps after them land, and what is known about it (a Claude session there) goes with them.
+INSERTERS = [{"win", "v"}, {"win", "."}, {"win", ";"}]
 
 
 def _new_foreground(existing: set[int], timeout: float = 1.5) -> int:
@@ -752,6 +1115,21 @@ def plan_press(keys: str, window: Window | None = None, run: Run | None = None, 
         ks = parse_keys(keys)
     except ValueError as e:
         return f"{e}，没有执行。"
+    if shell_shortcut(ks) and set(ks) in INSERTERS:
+        w = window or current_window()
+        if not w.pending and is_frontend(w.hwnd):
+            return FRONTEND_REFUSAL
+        facts = {"kind": "hotkey", "keys": list(ks), "window": w.title, **window_facts(w.hwnd)}
+
+        def go_insert():
+            why = ready_window(w, run if follows else None) or unasked_session(_fg_hwnd(), facts)
+            if why:
+                return why
+            if run is not None:
+                run.windows = _all_windows()
+            pyautogui.hotkey(*ks)
+            return f"已按 {'+'.join(ks)}。"
+        return Plan("hotkey", in_window(f"按{spoken_keys(ks)}", w.title), "", go_insert, facts, window=w)
     if shell_shortcut(ks):
         opener = set(ks) in OPENERS
         comes_up = Window(title="弹出的窗口", pending=True) if opener else None  # Win+R's Run box: what follows goes there
@@ -771,10 +1149,14 @@ def plan_press(keys: str, window: Window | None = None, run: Run | None = None, 
                     opens=comes_up)
     w = window or current_window()
     if not w.pending and is_frontend(w.hwnd):
-        return FRONTEND_REFUSAL
+        w = (window_behind_ours() if window is None else None) or w  # as for typing: the window the user was in
+        if is_frontend(w.hwnd):
+            return FRONTEND_REFUSAL
+
+    facts = {"kind": "hotkey", "keys": list(ks), "window": w.title, **window_facts(w.hwnd)}
 
     def go():
-        why = ready_window(w, run if follows else None) or replace_prompt_popped(w.title)
+        why = ready_window(w, run if follows else None) or replace_prompt_popped(w.title) or unasked_session(_fg_hwnd(), facts)
         if why:
             return why
         if run is not None:
@@ -784,8 +1166,7 @@ def plan_press(keys: str, window: Window | None = None, run: Run | None = None, 
         else:
             pyautogui.hotkey(*ks)
         return f"已按 {'+'.join(ks)}。"
-    return Plan("hotkey", in_window(f"按{spoken_keys(ks)}", w.title), "", go,
-                {"kind": "hotkey", "keys": list(ks), "window": w.title}, window=w)
+    return Plan("hotkey", in_window(f"按{spoken_keys(ks)}", w.title), "", go, facts, window=w)
 
 
 def plan_scroll(amount: int, target: str, x: int | None = None, y: int | None = None) -> Plan | str:
@@ -819,7 +1200,7 @@ def plan_open(name: str) -> Plan | str:
         time.sleep(0.2)
         _note_opened(opened, existing, before_fg, before_title, [label], cmd)
         return f"已打开{label}。现在的前台窗口：{active_window() or '（无）'}。输入文字前请确认这是对的窗口。"
-    return Plan("open_app", f"打开{label}", f"命令：{cmd}", go, {"kind": "open_app", "name": label}, opened)
+    return Plan("open_app", f"打开{label}", f"命令：{cmd}", go, {"kind": "open_app", "name": label, "command": cmd}, opened)
 
 
 def _note_opened(opened: Window, existing: set[int], before_fg: int, before_title: str, names: list[str],
@@ -942,7 +1323,9 @@ def click(x: int, y: int, target: str, button: str = "left", double: bool = Fals
 @server.tool()
 def type_text(text: str, purpose: str = "") -> str:
     """在当前前台窗口的光标位置输入文字（中英文都行；换行写 \\n）。申请时会念出目标窗口的名字和完整内容，
-    用户同意后才输入。注意：如果焦点在终端里，输入加回车就等于运行命令。purpose：一句话说明目的（可省略）。"""
+    用户同意后才输入。长文字（超过约 300 字）或多行文字（终端以外）会用一次粘贴放进去，不一个字一个字敲，所以长文字
+    也一次交给它，不要拆开；粘贴进去的换行只是换行，不会把聊天框里的消息发出去，要发送就单独再按 enter（文字末尾的
+    \\n 仍算回车）。注意：如果焦点在终端里，输入加回车就等于运行命令。purpose：一句话说明目的（可省略）。"""
     return _run(plan_type(text), purpose)
 
 
@@ -1010,8 +1393,8 @@ def run_steps(steps: list[dict], purpose: str = "") -> str:
             return f"第 {i} 步：{plan}"
         if plan.opens is not None:
             window = plan.opens
-        elif plan.window is not None:
-            window = plan.window
+        elif plan.window is not None and (tool != "click" or window is None):
+            window = plan.window  # a click names the window only when no step before it did (open_app's stays)
         prev = tool
         plans.append(plan)
     q = question(join_steps([p.what for p in plans]), purpose)

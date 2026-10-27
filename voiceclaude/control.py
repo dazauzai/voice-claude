@@ -10,12 +10,47 @@ from typing import Any, Callable
 log = logging.getLogger(__name__)
 
 
+def is_board(path: str) -> bool:
+    """The whiteboard page and its API: /board, /board/... or /board?... (not /board_show: that is a tool's request)."""
+    return path == "/board" or path.startswith(("/board/", "/board?"))
+
+
 class ControlServer:
-    def __init__(self, handler: Callable[[str, dict], dict[str, Any]]):
+    """POST /<path> with JSON: the tool servers' requests (handler). GET and POST under /board: the whiteboard
+    window's page and its API (web: (method, path, headers, body) -> (status, content type, body))."""
+
+    def __init__(self, handler: Callable[[str, dict], dict[str, Any]],
+                 web: Callable[[str, str, dict, bytes | None], tuple[int, str, bytes]] | None = None):
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
+            def _web(self, method: str):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0)) if method == "POST" else None
+                try:
+                    status, ctype, payload = web(method, self.path, dict(self.headers), body) if web else \
+                        (404, "text/plain; charset=utf-8", b"no board")
+                except Exception as e:
+                    log.exception("board request %s failed", self.path)
+                    status, ctype, payload = 500, "application/json; charset=utf-8", \
+                        json.dumps({"ok": False, "message": f"出错了：{e}"}, ensure_ascii=False).encode("utf-8")
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except OSError:
+                    pass  # the page went away while it waited
+
+            def do_GET(self):
+                if is_board(self.path):
+                    return self._web("GET")
+                self.send_error(404)
+
             def do_POST(self):
+                if is_board(self.path):
+                    return self._web("POST")
                 length = int(self.headers.get("Content-Length") or 0)
                 try:
                     data = json.loads(self.rfile.read(length) or b"{}")

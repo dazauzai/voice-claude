@@ -87,6 +87,21 @@ client.close()                           # 只断开连接；后台服务和线�
 - 事件 `{"event": "rewound", "line", "turn", "text"}`：任何一次撤回之后都发（口头说的也是），窗口在对话记录里加一行"—— 撤回到「…」之前 ——"。
 - 固定短语 `rewind_last`（"撤回上一句""退回上一句""回到上一句"等；单说"撤回"不算，那是给模型的话）= `rewind(当前线, steps=1)`，`spoken` 就是那句总结。窗口自己走 `client.rewind(steps=1)`（等得更久，并把那句放回输入框）。
 
+## 5c. 用量（token 和额度）
+
+- 事件 `{"event": "usage", "line", "provider", "model", "turn", "tokens": {"input", "output", "cache_read", "cache_write"}, "cost_usd", "cost_basis"}`：Claude Code 每轮结束（`result`）后发一次。`tokens` 是这一轮的（`result.usage`）；`cost_usd` 是这一轮按标价折算的美元（`total_cost_usd` 与上一轮之差），只在 Claude 线路上有，别家为 `null`。窗口在回答下面加一行"· 本轮用量：…"（只给当前线）。
+- 事件 `{"event": "limits", "provider": "claude", "status", "windows": {"five_hour": {"used", "resets_at"}, "seven_day": {...}, ...}, "overage"}`：Claude Code 报 `rate_limit_event` 时发（订阅才有；`used` 是 0–1）。状态变成 `allowed_warning` / `rejected` 时后台另发一句要念的通知。
+- `client.usage()` → `{"ok", "today": {provider: 合计}, "since_start": {provider: 合计}, "limits": {provider: 最近一次 limits 或 null}, "last_turn": {line: 最近一次 usage}}`，合计 = `turns, input, output, cache_read, cache_write, cost_usd`。按天的合计记在 `~/.voice-claude/usage.json`。设置页的「用量」一组打开时取一次，有新的 `usage` / `limits` 事件时再取。
+- 固定短语 `usage_status`（"用量怎么样""还剩多少额度"等）：后台念一句总结（额度用了多少、今天多少 token）。
+- API key 没有查余额的接口：设置页只写"在 console.anthropic.com 查看"。DeepSeek / Kimi / GPT 的余额还没做。
+
+## 5d. 发给其他 Claude 会话（桌面应用 Code 标签）
+
+- 线路用 Claude Code 自带的 ListAgents / SendMessage 找到并发给本机桌面应用里的 Claude Code 会话（按名字，不按文件夹）。消息写成"用户口述：…"，不改写用户的话。
+- SendMessage 每次都过口头申请：后台在 claude.exe 启动时用控制协议登记一个 PreToolUse 钩子（`initialize` 里的 `hooks`，只认 SendMessage），每次调用都会来一个 `hook_callback`，后台走 `switchboard.gate`（权限项 `send_to_session`，默认"询问"，通透模式不跳过），回 allow / deny；出错、超时都算 deny。
+- 我们自己的线路不接受别的会话发来的消息（`crossSessionInbound`），免得半路多出一轮。
+- 对方回答后，后台从对方会话的记录里读出回答，发事件 `{"event": "relay_reply", "to", "text", "session"}`；窗口在对话记录里以对方的名字显示并念出来。这是对方会话的话，只给用户看和听，不交给线路当指令。
+
 ## 6. 三级打断在接口上的样子
 
 - ①（开口）：全在前台：压低、停朗读、排队；**不发任何命令**。这一轮的 `done` 到了再把排队的话 `say` 出去。

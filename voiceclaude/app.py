@@ -13,7 +13,8 @@ from tkinter import messagebox, ttk
 
 import numpy as np
 
-from . import audio, config, testing, voices, text as textmod
+from . import audio, board_window, config, paths, standby, testing, usage_view, voices, wake, text as textmod
+ICON = config.ROOT / "voiceclaude" / "assets" / "voice-claude.ico"  # Cadence, the mascot (docs/mascot)
 from .asr import Recognizer
 from .client import DaemonClient
 from .config import Config, missing_models
@@ -22,7 +23,7 @@ from .tts import Speaker
 from .ui_access import AccessPage, describe as describe_access, describe_is_error
 from .ui_theme import (BAND_COLORS, COLORS, JOB_WORDS, PERMISSION_NAMES, PERMISSION_WORDS, STATES, Theme, ask_title, band_for,
                        classify_status, fit_hint, heard_suffix, hint_for, is_ascii, parse_job_note, permissions_summary,
-                       status_display, tool_word, truncate_to_width, wrap_mode)
+                       is_desktop_tool, status_display, tool_word, truncate_to_width, wrap_mode)
 from .ui_widgets import (AnsweredCard, BackToLatest, CheckRow, DockedCard, LineChip, LinePanel, NavGroup, Segmented, StateOrb, TypeBox,
                          flat_button, header_padx, page_header, place_button, style_button)
 
@@ -42,6 +43,11 @@ def foreground_outside(root) -> int:
         return 0
 
 
+def missing_note(name: str) -> str:
+    """After a device line: the configured device was not there at startup, so the system default plays."""
+    return f"（没找到「{name}」，用系统默认）" if name else ""
+
+
 def bring_back(hwnd: int) -> None:
     """Give the focus back to a window this one took it from (allowed: this window is in front right now)."""
     if hwnd and os.name == "nt" and not testing.under_test_runner():
@@ -55,8 +61,15 @@ FONT = "Microsoft YaHei UI"
 
 
 class App:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, woken: bool = False, from_standby: bool = False):
         self.cfg = cfg
+        self.woken = woken  # started by the wake word: listen as soon as it is ready
+        self.from_standby = from_standby  # go back to standby after cfg.wake_idle_minutes idle
+        self.spotter: wake.Spotter | None = None  # the wake word, while idle
+        self._idle_since = time.monotonic()
+        self._wake_listen_until = 0.0  # listening started by the wake word gives up at this time without speech
+        self._listen_when_quiet = False  # woken: listen once the greeting has been spoken (it must not hear itself)
+        self._relays_waiting: set[str] = set()  # replies from other sessions still on their way
         self.lock = threading.RLock()
         self.state = IDLE
         self.conversation = False
@@ -92,15 +105,28 @@ class App:
         self._turns: dict[str, tuple[str, str, str]] = {}  # transcript tag -> (line, turn id, text) of a sent message
         self._rewinding = False  # a rewind is on its way (the service may be asking about files, then restarting)
         self._turn_seq = 0  # counts turns opened, so a late reply to an old one leaves the newest alone
+        self._new_players = 0  # fresh players given in a row because the sound card stopped taking audio
+        self._stuck_player = None  # the stuck player kept once no new one was left to give
+        self._stuck_progress = 0.0  # its progress_at then: if it moves, it played again
+        self.usage_snapshot: dict | None = None  # the service's "usage" reply, shown on the settings page
         self._closing = False  # quit() ran: the UI loop must not reschedule itself
 
     # ---------- startup / shutdown ----------
 
     def run(self):
         self._build_window()
+        self._set_icon()
         threading.Thread(target=self._load, daemon=True, name="load").start()
         self.root.after(50, self._drain_ui)
         self.root.mainloop()
+
+    def _set_icon(self):
+        """The taskbar and title bar show the mascot. After the window is built: setting the icon realises the window,
+        and a bar measured before its size was set would shrink its buttons."""
+        try:
+            self.root.iconbitmap(str(ICON))
+        except tk.TclError:
+            log.warning("window icon not set: %s", ICON)
 
     def _load(self):
         try:
@@ -108,13 +134,15 @@ class App:
             if missing:
                 raise FileNotFoundError("缺少语音模型：" + "、".join(missing) + "。再双击 install.bat 下载。")
             self._status("正在加载语音模型…")
-            self.player = audio.Player(self.cfg.speaker)
+            self.player = audio.Player(self.cfg.speaker, fallback=True)
             audio.OUTPUT_DEVICE = self.player.device
             self.speaker = Speaker(self.cfg.voice, self.cfg.speed, self.player, self._on_speech_idle)
             self.recognizer = Recognizer(self.cfg.replacements)
-            self.endpointer = audio.Endpointer(self.cfg.silence_seconds)
-            self.answer_endpointer = audio.Endpointer(0.8)  # 可以 / 不行 are one or two words
-            self.mic = audio.Microphone(self.cfg.microphone, self.audio_q.put)
+            gate = dict(min_level=self.cfg.min_level, level_ratio=self.cfg.level_ratio)
+            self.endpointer = audio.Endpointer(self.cfg.silence_seconds, **gate)
+            self.answer_endpointer = audio.Endpointer(0.8, min_speech=0.15, **gate)  # 可以 / 不行: one or two words
+            self.spotter = self._load_spotter()
+            self.mic = audio.Microphone(self.cfg.microphone, self.audio_q.put, fallback=True)
             self.mic.start()
             threading.Thread(target=self._audio_worker, daemon=True, name="audio").start()
             self._status("正在连接后台服务…")
@@ -123,6 +151,10 @@ class App:
             for line in info.get("lines", []):
                 self.lines[line["line"]] = line
             self._refresh_lines()
+            for j in info.get("jobs", []) or []:  # recovered after a restart: the idle check and 退出 must see them
+                if j.get("job") and j.get("state") == "running":
+                    self.jobs.setdefault(str(j["job"]), {"id": str(j["job"]), "state": "running", "note": str(j.get("note") or ""),
+                                                         "started": time.time()})
             if not os.environ.get("VOICECLAUDE_NO_HOTKEY"):
                 self.hotkey = HotkeyListener(self.cfg.hotkey, self.cfg.double_tap_seconds, self._on_tap, self._on_double,
                                              self._on_hold, self.cfg.hold_seconds)
@@ -135,14 +167,68 @@ class App:
             self.ready = True
             self._status("空闲")
             self.ui_q.put(("devices", self.mic.name, self.player.name))
-            self._note(f"· 麦克风：{self.mic.name}")
-            self._note(f"· 扬声器：{self.player.name}")  # the port is in the log only
-            self.speaker.say("准备好了。")  # if you can't hear this, check the speaker line above / config.toml
+            self._note(f"· 麦克风：{self.mic.name}" + missing_note(self.mic.missing))
+            self._note(f"· 扬声器：{self.player.name}" + missing_note(self.player.missing))  # the port is in the log only
+            self._greet()
         except Exception as e:
             log.exception("startup failed")
             self._status("启动失败")
             self._note(f"启动失败：{e}")
             audio.tone("error")
+
+    def _greet(self):
+        if self.woken:  # the wake word brought the window up: what you say next is the request, after the greeting
+            self._listen_when_quiet = True
+        else:
+            self.speaker.say("准备好了。")  # if you can't hear this, check the speaker line above / config.toml
+
+    def _idle_chunk(self, chunk) -> None:
+        """Lock held, state IDLE: the wake word starts listening, like a double tap without staying in conversation."""
+        if self.endpointer is not None:
+            self.endpointer.observe(chunk)  # the room's noise level, known before the first listen
+        if self.spotter is not None and self.ready and self.spotter.feed(chunk):
+            log.info("wake word heard")
+            self._wake_listen()
+
+    WAKE_LISTEN_SECONDS = 8.0  # after the wake word, this long to start talking
+
+    def _wake_listen(self) -> None:
+        """Lock held: listen for one request; a false wake gives up after WAKE_LISTEN_SECONDS of no speech."""
+        self._listen()
+        self._wake_listen_until = time.monotonic() + self.WAKE_LISTEN_SECONDS
+
+    def _tick_wake(self, now: float) -> None:
+        """Every UI tick: start the woken listen once it is quiet; end a wake listen nobody spoke into."""
+        with self.lock:
+            if self._listen_when_quiet and self.ready and self.state == IDLE and self.speaker.idle():
+                self._listen_when_quiet = False
+                self._wake_listen()
+            elif self._wake_listen_until:
+                if self.state != LISTENING or self.conversation:
+                    self._wake_listen_until = 0.0  # your sentence went out (or something else took over)
+                elif self.endpointer.active:
+                    self._wake_listen_until = now + self.WAKE_LISTEN_SECONDS  # talking: a dropped cough still gives up
+                elif now >= self._wake_listen_until:
+                    self._wake_listen_until = 0.0
+                    self.state = IDLE
+                    self._status("空闲")
+                    audio.tone("stop")
+
+    def wake_settings(self) -> tuple[str, float]:
+        keyword = str(getattr(self.cfg, "wake_keyword", "") or wake.DEFAULT_KEYWORD)
+        return keyword, float(getattr(self.cfg, "wake_threshold", 0) or wake.DEFAULT_THRESHOLD)
+
+    def _load_spotter(self) -> wake.Spotter | None:
+        if not wake.model_ready():
+            return None
+        keyword, threshold = self.wake_settings()
+        try:
+            return wake.Spotter(keyword, threshold)
+        except wake.WakeWordError as e:
+            self._note(f"（唤醒词用不了：{e}）")
+        except Exception:
+            log.exception("wake word failed to load")
+        return None
 
     def _connect(self) -> dict:
         """Separate so a test harness can point the app at its own daemon."""
@@ -346,13 +432,55 @@ class App:
         with self.lock:
             if self.state != BUSY or self.turn_open or not self.speaker.idle():
                 return
-            if self.conversation:
-                # With barge-in on (headphones) the mic was watched the whole time Claude spoke, so anything
-                # you already started saying is kept. On speakers it would be Claude's own voice.
-                self._listen(keep_audio=self.cfg.barge_in)
+            self._turn_over()
+
+    MAX_NEW_PLAYERS = 3  # hangs in a row that get a fresh player (each given-up one leaves a blocked thread)
+
+    def _end_stuck_turn(self):
+        """Speech has not moved for a minute of the PC being awake (the sound card stopped taking audio), whatever is
+        being said: a reply, the greeting, a notice, a card's question. Speech goes on through a new player and the
+        stuck one is given up; a reply that was all there also ends its turn. Otherwise the speaker's on_idle never
+        comes: the window stays busy for good (and never goes back to standby), and on speakers a card cannot be
+        answered by voice."""
+        with self.lock:
+            # a card waits only 60 s for its answer: its question must be heard well before that
+            if (self.speaker is None or self.speaker.idle()
+                    or not self.speaker.stuck(after=10.0 if self.state == APPROVING else 60.0)):
+                return
+            ends_turn = self.state == BUSY and not self.turn_open and not self.transcribing
+            if self._stuck_player is self.player and self.player.progress_at == self._stuck_progress:
+                # no new player left to give, and that was said already (unless it has played since)
+                if ends_turn:
+                    self.speaker.stop()
+                    self._turn_over()
+                return
+            log.warning("speech has not moved for over a minute (the sound card stopped taking audio?)")
+            self.speaker.stop()
+            if self.player.progress_at:  # this one played before it hung: only hangs in a row count
+                self._new_players = 0
+            if self._new_players < self.MAX_NEW_PLAYERS:
+                self._new_players += 1
+                self._note("（扬声器没有响应）")
+                self.player = audio.Player(self.player.name.strip())
+                audio.OUTPUT_DEVICE = self.player.device
+                self.speaker.replace_player(self.player)
+                if self.state == APPROVING and self.approval:  # the card's question, dropped above, again
+                    self.speaker.say(self.approval.get("question", ""))
             else:
-                self.state = IDLE
-                self._status("空闲")
+                self._stuck_player, self._stuck_progress = self.player, self.player.progress_at
+                self._note("（扬声器没有响应 · 重启 voice-claude）")
+            if ends_turn and self.state == BUSY:  # the given-up sentence's done may have ended it already (on_idle)
+                self._turn_over()
+
+    def _turn_over(self):
+        """Lock held: the reply has been read out."""
+        if self.conversation:
+            # With barge-in on (headphones) the mic was watched the whole time Claude spoke, so anything
+            # you already started saying is kept. On speakers it would be Claude's own voice.
+            self._listen(keep_audio=self.cfg.barge_in)
+        else:
+            self.state = IDLE
+            self._status("空闲")
 
     # ---------- audio ----------
 
@@ -366,6 +494,9 @@ class App:
                 state, conv = self.state, self.conversation
                 if state == RECORDING:
                     self.record_buf.append(chunk)
+                    continue
+                if state == IDLE:
+                    self._idle_chunk(chunk)
                     continue
                 if state == LISTENING:
                     utt = self.endpointer.feed(chunk)
@@ -454,6 +585,12 @@ class App:
             if not self.turn_open:
                 self._after_turn()
             return None
+        if key == "open_board":  # also a window action: the board window is its own process
+            self._line("你", text)
+            self.ui_q.put(("call", self._open_board))
+            if not self.turn_open:
+                self._after_turn()
+            return None
         if key == "rewind_last":  # like 从这里重来 on your last sentence: it may ask about files and restart the line
             self._line("你", text)
             self._start_rewind(self.client.active, "", steps=1)
@@ -533,13 +670,17 @@ class App:
             self.state = IDLE
             self._status("空闲")
 
-    def _begin_turn(self) -> bool:
-        """Lock held: open a turn on the active line."""
+    def _begin_turn(self, drop_reading: bool = True) -> bool:
+        """Lock held: open a turn on the active line. Whatever of the last reply is still being read out is dropped
+        (it stays on screen): the reading starts again with the new reply, not behind the old one. drop_reading
+        False: the caller has just said something (an error, a rewind's result) that must be heard first."""
         self.splitter = textmod.SentenceSplitter()
         self.reply = ""
         self.turn_open = True
         self._turn_seq += 1
         self.state = BUSY
+        if drop_reading and self.speaker is not None:
+            self.speaker.stop()
         self._status("思考中…")
         self._line("Claude", "")
         return True
@@ -611,7 +752,7 @@ class App:
             if self.state in (RECORDING,) or self.approval is not None or not self.ready:
                 return False, ""
             self.approval = {"event": threading.Event(), "answer": None, "text": "", "unclear": 0,
-                             "kind": kind, "prev": self.state}
+                             "kind": kind, "prev": self.state, "question": question}
             event = self.approval["event"]
             self.state = APPROVING
             self.answer_endpointer.reset()
@@ -715,11 +856,41 @@ class App:
         if kind == "job":
             self._note(f"后台任务 {data.get('job')}：{data.get('state')} {data.get('note', '')}".strip())
             return
+        if kind == "board":  # a line wants to look at its board, and no window shows it: open one
+            if data.get("want") == "look":
+                self._note("（它想看白板：打开了）")
+                self.ui_q.put(("call", lambda: self._open_board(str(data.get("line") or ""))))
+            return
         if kind == "line":
             self._on_line(data)
             return
         if kind == "transparent":
             self.ui_q.put(("call", lambda: self._show_transparent(bool(data.get("on")))))
+            return
+        if kind == "usage":  # after each turn: the line under the reply (the line in front only)
+            if data.get("line") in (None, "", self.client.active):
+                self._note(usage_view.turn_line(data))
+            self._usage_changed()
+            return
+        if kind == "limits":
+            self._usage_changed()
+            return
+        if kind == "relay_waiting":
+            self._relays_waiting.add(self._relay_key(data))
+            return
+        if kind == "relay_done":
+            self._relays_waiting.discard(self._relay_key(data))
+            return
+        if kind == "relay_reply":  # another Claude session answering what you sent it: shown and read out, never obeyed
+            self._relays_waiting.discard(self._relay_key(data))
+            who, text = str(data.get("to") or "另一个会话"), str(data.get("text") or "").strip()
+            partial = data.get("done") is False  # the wait ended while it was still answering: only what it had said
+            if text:
+                label = f"{who} · 未完" if partial else who
+                self.ui_q.put(("call", lambda: self._insert_labelled("claude", label, text)))
+                splitter = textmod.SentenceSplitter()
+                for i, s in enumerate(splitter.feed(text) + splitter.flush()):
+                    self.speaker.say((f"{who}还没说完，到现在的回复：{s}" if partial else f"{who}回复：{s}") if i == 0 else s)
             return
         if kind == "rewound":
             said = " ".join(str(data.get("text") or "").split())
@@ -757,8 +928,15 @@ class App:
                 for s in self.splitter.feed(delta):
                     self._status("在说…")
                     self.speaker.say(s)
+            elif kind == "writing":  # a long tool call still being written: say so, or it looks stopped
+                if data.get("done"):
+                    self._status("思考中…")
+                else:
+                    self._status(f"正在写…（{int(data.get('chars') or 0)} 字）")
             elif kind == "tool":
                 log.info("tool: %s %s", data.get("name"), str(data.get("detail", ""))[:200])
+                if is_desktop_tool(str(data.get("name", ""))):
+                    self.ui_q.put(("call", self._step_aside))
                 self._status(tool_word(str(data.get("name", ""))))
                 self._note(f"· {data.get('name')} {str(data.get('detail', ''))[:80]}")
             elif kind == "done":
@@ -766,7 +944,12 @@ class App:
                 self.done_event.set()
                 status = data.get("status", "ok")
                 log.info("claude (%s): %s", status, self.reply.replace("\n", " ")[:2000])
-                if status == "ok" and self.splitter:
+                # words waiting (and no card up: _ask sends them itself when it is answered): the rest of this
+                # reply is shown, not read, and the next turn opens now
+                queued_go = bool(self.queued) and self.state != APPROVING
+                if queued_go:
+                    self.speaker.stop()
+                if status == "ok" and self.splitter and not queued_go:
                     for s in self.splitter.flush():
                         self.speaker.say(s)
                 elif status == "error":
@@ -774,10 +957,10 @@ class App:
                     audio.tone("error")
                     self.speaker.say("这一轮出错了，看一下屏幕。")
                 self.splitter = None
-                if self.queued:
+                if queued_go:
                     send_queued = list(self.queued)
                     self.queued.clear()
-                    self._begin_turn()
+                    self._begin_turn(drop_reading=False)
         if send_queued:
             threading.Thread(target=self._say, args=("\n".join(send_queued), send_queued), daemon=True).start()
         else:
@@ -826,8 +1009,8 @@ class App:
                 config.save("tts", "speed", speed)
                 result = {"ok": True, "message": f"语速已改成 {speed:g}"}
             elif path == "list_devices":
-                result = {"ok": True, "message": "麦克风：" + "；".join(audio.list_devices(False)) +
-                                                 "\n扬声器：" + "；".join(audio.list_devices(True))}
+                result = {"ok": True, "message": "麦克风：" + "；".join(audio.current_devices(False)) +
+                                                 "\n扬声器：" + "；".join(audio.current_devices(True))}
             elif path == "set_font_size":
                 self._set_font(int(args["size"]))
                 result = {"ok": True, "message": f"字号已改成 {self.font_size}"}
@@ -859,22 +1042,52 @@ class App:
 
     def _set_mic(self, name: str):
         with self.lock:
-            new = audio.Microphone(name, self.audio_q.put)
-            new.start()
-            old, self.mic = self.mic, new
-            if old:
-                old.stop()
+            try:
+                new = audio.Microphone(name, self.audio_q.put)
+            except ValueError:  # connected after startup: PortAudio does not know it yet
+                self._restart_audio(name, self.player.name.strip())
+                new = self.mic
+            else:
+                new.start()
+                old, self.mic = self.mic, new
+                if old:
+                    old.stop()
             self.endpointer.reset()
         config.save("audio", "microphone", new.name.strip())
         self._note(f"麦克风已切换到 {new.name}")
         self.ui_q.put(("devices", self.mic.name, self.player.name))
 
     def _set_speaker(self, name: str):
-        self.player.set_device(name)
-        audio.OUTPUT_DEVICE = self.player.device
+        with self.lock:
+            try:
+                self.player.set_device(name)
+            except ValueError:  # connected after startup: PortAudio does not know it yet
+                self._restart_audio(self.mic.name.strip(), name)
+            audio.OUTPUT_DEVICE = self.player.device
         config.save("audio", "speaker", self.player.name.strip())
         self._note(f"扬声器已切换到 {self.player.name}")
         self.ui_q.put(("devices", self.mic.name, self.player.name))
+
+    def _restart_audio(self, mic_name: str, speaker_name: str) -> None:
+        """A device connected after startup: close the microphone and the speaker, start PortAudio again so it sees
+        it, and open both again (the one asked for must be there now; the other falls back to the default if it went
+        away). What was being said stops."""
+        with self.lock:
+            if self.speaker is not None:
+                self.speaker.stop()
+            if self.mic is not None:
+                self.mic.stop()
+            old = self.player
+            if old is not None:
+                old.close()
+                old.thread.join(1.0)
+            audio.restart_portaudio()
+            self.player = audio.Player(speaker_name, fallback=True)
+            audio.OUTPUT_DEVICE = self.player.device
+            if self.speaker is not None:
+                self.speaker.replace_player(self.player)
+            self.mic = audio.Microphone(mic_name, self.audio_q.put, fallback=True)
+            self.mic.start()
 
     # ---------- window ----------
     # Everything below is the window side (docs/architecture.md, "The window"). It only reads the voice state machine's
@@ -885,12 +1098,18 @@ class App:
     ASK_SECONDS = 60  # _ask waits this long; the card counts it down
     ANSWER_GRACE = 1.0  # a typed answer begun sooner than this after the card came up was begun for something else
 
+    @staticmethod
+    def _callback_failed(exc, val, tb):
+        """Tk prints errors in window callbacks to stderr, which pythonw (run.bat, standby) does not have."""
+        log.error("window callback failed", exc_info=(exc, val, tb))
+
     def _build_window(self):
         try:  # crisp text on high-DPI screens (150 % scaling is common)
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
         self.root = tk.Tk()
+        self.root.report_callback_exception = self._callback_failed
         self.root.title("voice-claude")
         self.theme = Theme(self.root, self.font_size)
         self.theme.apply_ttk_style()
@@ -926,9 +1145,13 @@ class App:
         self._bar_mode = 0  # 0 = all buttons, 1 = settings in the chip menu, 2 = mute as an icon
         self._col_extra = 0  # padding either side of the capped text column (large window)
         self._drain_after = None  # the pending _drain_ui tick; cancelled when the window goes away
+        self._aside = False  # shrunk to a corner while a line works on the desktop
+        self._aside_geometry = ""  # where it was before
+        self._hands_off_until = 0.0  # you took the window back: not shrunk again before this
         self.status_var = tk.StringVar(value="启动中…")
         self.hint_var = tk.StringVar(value="")  # shared by the hint row and the docked card's footnote
         self.topmost_var = tk.BooleanVar(value=True)
+        self.aside_var = tk.BooleanVar(value=bool(getattr(self.cfg, "aside_for_desktop", True)))
         self.hints_var = tk.BooleanVar(value=self.show_hints)
         self.root.attributes("-topmost", True)
         self._build_band()
@@ -1113,19 +1336,40 @@ class App:
         self.access_nav = nav.add("AI 服务商", lambda: self._open_access())
         self.perm_nav = nav.add("权限", self._open_permissions)
 
+        self.usage_box = group("用量")
+        self._paint_usage(self.usage_snapshot)
+
         g = group("声音")
         r = row(g, "麦克风")
         self.mic_var = tk.StringVar(value=self._devices[0])
         self.mic_box = ttk.Combobox(r, textvariable=self.mic_var, values=audio.list_devices(False), state="readonly",
-                                    style="Card.TCombobox", font=t.font("ctrl"))
+                                    style="Card.TCombobox", font=t.font("ctrl"),
+                                    postcommand=lambda: self.mic_box.configure(values=audio.current_devices(False)))
         self.mic_box.bind("<<ComboboxSelected>>", lambda e: threading.Thread(target=self._set_mic, args=(self.mic_var.get(),), daemon=True).start())
         self.mic_box.pack(side="right", fill="x", expand=True, padx=(px(16), 0), ipady=px(3))
         r = row(g, "扬声器")
         self.spk_var = tk.StringVar(value=self._devices[1])
         self.spk_box = ttk.Combobox(r, textvariable=self.spk_var, values=audio.list_devices(True), state="readonly",
-                                    style="Card.TCombobox", font=t.font("ctrl"))
-        self.spk_box.bind("<<ComboboxSelected>>", lambda e: self._set_speaker(self.spk_var.get()))
+                                    style="Card.TCombobox", font=t.font("ctrl"),
+                                    postcommand=lambda: self.spk_box.configure(values=audio.current_devices(True)))
+        self.spk_box.bind("<<ComboboxSelected>>",
+                          lambda e: threading.Thread(target=self._set_speaker, args=(self.spk_var.get(),), daemon=True).start())
         self.spk_box.pack(side="right", fill="x", expand=True, padx=(px(16), 0), ipady=px(3))
+
+        g = group("唤醒词")
+        keyword, _ = self.wake_settings()
+        r = row(g, f"「{keyword}」")
+        problem = self._wake_problem()
+        tk.Label(r, text=problem or "可用", font=t.font("cap"), fg=COLORS["state_error"] if problem else COLORS["text_secondary"],
+                 bg=bg).pack(side="right")
+        self.autostart_var = tk.BooleanVar(value=standby.autostart_enabled())
+        CheckRow(body, t, "开机自动进入值守", self.autostart_var, self._set_autostart, bg).pack(
+            fill="x", padx=(pad - px(2), pad), pady=(px(2), 0))
+        b = flat_button(body, t, "现在进入值守", self._enter_standby)
+        place_button(b, t, anchor="w", padx=pad, pady=(px(4), 0))
+        if standby.standby_running():
+            b = flat_button(body, t, "关掉值守", self._stop_standby)
+            place_button(b, t, anchor="w", padx=pad, pady=(px(4), 0))
 
         g = group("显示")
         r = row(g, "字号")
@@ -1141,9 +1385,16 @@ class App:
         # in the body, not the group: their 2 px focus ring sits outside the column, so the text lines up with 字号
         ring = (pad - px(2), pad - px(2))
         CheckRow(body, t, "始终置顶", self.topmost_var, self._set_topmost, bg).pack(fill="x", padx=ring, pady=(px(2), 0))
+        CheckRow(body, t, "操作桌面时缩到角落", self.aside_var, self._set_aside, bg).pack(fill="x", padx=ring, pady=(px(2), 0))
         CheckRow(body, t, "显示快捷键提示", self.hints_var, self._set_hints, bg).pack(fill="x", padx=ring)
 
         g = group("高级")
+        r = row(g, "白板")
+        b = flat_button(r, t, "打开", self._open_board)
+        place_button(b, t, side="right")
+        r = row(g, "记录")
+        b = flat_button(r, t, "打开", self._open_records)
+        place_button(b, t, side="right")
         r = row(g, "配置文件")
         b = flat_button(r, t, "打开", self._open_config)
         place_button(b, t, side="right")
@@ -1233,6 +1484,8 @@ class App:
     # ----- keys inside the window (the global hotkey is untouched) -----
     def _bind_keys(self):
         r = self.root
+        for seq in ("<KeyPress>", "<ButtonPress>", "<MouseWheel>"):
+            r.bind_all(seq, self._touched, add="+")
         r.bind("<Escape>", lambda e: self._escape())
         box = self.typebox.text
         r.bind("<End>", lambda e: None if e.widget is box else self._to_latest())
@@ -1348,12 +1601,45 @@ class App:
                 return
             parts = list(self.queued)
             self.queued.clear()
-            self._begin_turn()
+            self._begin_turn(drop_reading=False)  # the rewind's or the card's spoken result comes first
         threading.Thread(target=self._say, args=("\n".join(parts), parts), daemon=True).start()
 
     def _set_topmost(self, on: bool):
         self.topmost_var.set(on)
         self.root.attributes("-topmost", on)
+
+    def _set_aside(self, on: bool):
+        self.aside_var.set(bool(on))
+        self.cfg.aside_for_desktop = bool(on)
+        config.save("ui", "aside_for_desktop", bool(on))
+        if not on:
+            self._come_back()
+
+    # ---------- out of the way while a line works on the desktop ----------
+
+    ASIDE_HOLD_SECONDS = 30.0  # after you took the window back, it is not shrunk again this long
+
+    def _step_aside(self):
+        """Tk thread: shrink to a small bar in the bottom-right corner, so the window does not cover what the line
+        is about to click and is not mistaken for the target in its screenshots."""
+        if self._aside or not self.aside_var.get() or time.monotonic() < self._hands_off_until:
+            return
+        px = self.theme.px
+        self._aside_geometry = self.root.geometry()
+        w, h = px(300), self.theme.bar_h + px(8)
+        x = max(0, self.root.winfo_screenwidth() - w - px(16))
+        y = max(0, self.root.winfo_screenheight() - h - px(64))  # above the taskbar
+        self.root.minsize(1, 1)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self._aside = True
+
+    def _come_back(self):
+        if not self._aside:
+            return
+        self._aside = False
+        self.root.minsize(self.theme.min_w, self.theme.min_h)
+        if self._aside_geometry:
+            self.root.geometry(self._aside_geometry)
 
     def _set_hints(self, on: bool):
         self.show_hints = bool(on)
@@ -1404,12 +1690,97 @@ class App:
             log.debug("could not reload permissions", exc_info=True)
         self._refresh_permissions()
 
+    def _set_autostart(self, on: bool):
+        keyword, _ = self.wake_settings()
+        problem = self._wake_problem() if on else ""
+        if problem:
+            self._note(f"（不能开机自动进入值守：{problem}）")
+            self.autostart_var.set(False)
+            return
+        if on and not ask_ok(self.root, "开机自动进入值守",
+                             f"登录 Windows 后自动进入值守：麦克风一直开着，听到「{keyword}」才打开窗口。\n打开吗？"):
+            self.autostart_var.set(False)
+            return
+        try:
+            standby.set_autostart(on)
+        except Exception as e:
+            log.warning("autostart: %s", e)
+            self._note(f"（开机自动进入值守没设好：{e}）")
+        self.autostart_var.set(standby.autostart_enabled())
+
+    def _wake_problem(self) -> str:
+        """Why standby could not listen for the wake word, or ""."""
+        if not wake.model_ready():
+            return "唤醒词模型没下载"
+        keyword, threshold = self.wake_settings()
+        try:
+            wake.keyword_lines(keyword, threshold)
+        except wake.WakeWordError as e:
+            return str(e)
+        return ""
+
+    def _stop_standby(self):
+        try:
+            standby.stop_standby()
+        except Exception as e:
+            self._note(f"（没能关掉值守：{e}）")
+            return
+        self.from_standby = False  # no standby to go back to: the window stays until you close it
+        self._note("（值守关掉了；窗口关掉以后不再听唤醒词）")
+
+    def _enter_standby(self):
+        """Close this window and leave only the wake word listening (once the quit is confirmed)."""
+        problem = self._wake_problem()
+        if problem:
+            self._note(f"（不能进入值守：{problem}）")
+            return
+        self._request_quit(then=standby.start_standby)
+
     def _open_settings(self):
         self._close_panel()
         self._reload_permissions()
         self.config_caption.configure(text=CONFIG_CAPTION, fg=COLORS["text_secondary"])
         self._paint_access_summary()
         self._show_page("settings")
+        self._fetch_usage()
+
+    def _usage_changed(self):
+        if self.page == "settings":
+            self._fetch_usage()
+
+    def _fetch_usage(self):
+        """Today's and this run's totals and Claude's quota from the service, off the UI thread."""
+        fn = getattr(self.client, "usage", None)
+        if fn is None or not self.ready or self.daemon_gone:
+            return
+
+        def go():
+            try:
+                snap = fn()
+            except Exception as e:
+                log.info("usage: %s", e)
+                return
+            if isinstance(snap, dict) and snap.get("ok", True):
+                self.ui_q.put(("call", lambda: self._paint_usage(snap)))
+        threading.Thread(target=go, daemon=True, name="usage").start()
+
+    def _paint_usage(self, snap: dict | None):
+        self.usage_snapshot = snap
+        box = getattr(self, "usage_box", None)
+        if box is None or not box.winfo_exists():
+            return
+        for w in box.winfo_children():
+            w.destroy()
+        t, px, bg = self.theme, self.theme.px, COLORS["bg_card"]
+        access = self._access_info or {}
+        method = str(access.get("method", "")) if str(access.get("provider") or "claude") == "claude" else ""
+        rows = usage_view.settings_rows(snap, method) if snap is not None else [("用量", "正在读取…", False)]
+        for name, value, warn in rows:
+            tk.Label(box, text=name, anchor="w", font=t.font("ctrl"), fg=COLORS["text_primary"], bg=bg).pack(fill="x")
+            v = tk.Label(box, text=value, anchor="w", justify="left", font=t.font("cap"), bg=bg,
+                         fg=COLORS["state_ask"] if warn else COLORS["text_secondary"])
+            v.pack(fill="x", pady=(0, px(6)))
+            v.bind("<Configure>", lambda e, v=v: v.configure(wraplength=max(100, e.width - 4)))
 
     def _open_permissions(self):
         self._reload_permissions()
@@ -1459,6 +1830,29 @@ class App:
     def _open_config(self):
         try:
             os.startfile(str(config.user_config_path()))
+        except Exception as e:
+            self.config_caption.configure(text=f"无法打开：{e}", fg=COLORS["state_error"])
+
+    def _open_board(self, line: str = ""):
+        """The whiteboard of a project line (the active one unless given), in its own window. 打开白板, the settings
+        row, or a line asking to look at a board nobody shows."""
+        line = line or str(getattr(self.client, "active", "") or "")
+        if not line or self._gone():
+            self._note("（没有连上后台服务，白板打不开）")
+            return
+        name = str((self.lines.get(line) or {}).get("name") or "")
+        try:
+            board_window.open_board(line, name)
+        except Exception as e:
+            log.warning("board window: %s", e)
+            self._note(f"（白板打不开：{e}）")
+
+    def _open_records(self):
+        """The records folder: one <project>.md per project, voice-claude's long-term memory (written by the lines'
+        record tool, read back into their prompts)."""
+        try:
+            paths.RECORDS_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(paths.RECORDS_DIR))
         except Exception as e:
             self.config_caption.configure(text=f"无法打开：{e}", fg=COLORS["state_error"])
 
@@ -1523,12 +1917,18 @@ class App:
                 names.insert(0, name)
         return names
 
-    def _request_quit(self):
+    def _request_quit(self, then=None):
+        """then: run once the quit is confirmed, before the service is asked to shut down (现在进入值守)."""
         self._close_panel()
         if self._quit_requested:
             return
         if not self.ready or self.daemon_gone or not getattr(self.client, "connected", False):
             log.info("quit without the service (ready=%s, gone=%r)", self.ready, self.daemon_gone)
+            if then is not None:
+                try:
+                    then()
+                except Exception as e:
+                    log.warning("before quitting: %s", e)
             self.quit()
             return
         # One question for everything that quitting interrupts. Running jobs are stopped, not left behind: whether a
@@ -1544,6 +1944,12 @@ class App:
             return
         jobs = "stop" if running else "ask"  # jobs this window has not seen: the service asks about them out loud
         self._quit_requested = True
+        if then is not None:
+            try:
+                then()
+            except Exception as e:
+                log.warning("before quitting: %s", e)
+                self._note(f"（{e}）")
         log.info("quit: asking the service to shut down (jobs=%s)", jobs)
         self._status("正在退出…")
         threading.Thread(target=self._shutdown_for_quit, args=(jobs, len(self._lines_snapshot[0]), bool(busy)),
@@ -1574,6 +1980,57 @@ class App:
         if not self._closing:
             log.info("no bye after the shutdown; closing the window anyway")
             self.quit()
+
+    def _idle_now(self) -> bool:
+        """Nothing that going back to standby would interrupt or lose: no turn, card, queue, rewind, draft; no line
+        working and nothing unread on any line; no running job; no reply from another session on its way; not muted
+        (going back would open the microphone again); not on a settings page."""
+        lines = self._lines_snapshot[0]
+        return (self.ready and not self._quit_requested and not self.muted and self.state == IDLE and not self.conversation
+                and (self.speaker is None or self.speaker.idle() or self.speaker.stuck())  # still reading out
+                and not self.turn_open and self.card is None and not self.queued and not self._rewinding
+                and self.page == "transcript" and not self.typebox.value().strip() and not self._relays_waiting
+                and not any(l.get("state") == "working" or int(l.get("unread") or 0) for l in lines.values())
+                and not any(j.get("state") == "running" for j in self.jobs.values()))
+
+    @staticmethod
+    def _relay_key(data: dict) -> str:
+        """One wait per message sent (the SendMessage id); older services only name the session."""
+        return str(data.get("relay") or data.get("session") or data.get("to") or "?")
+
+    def _touched(self, _event=None):
+        """You used the window (a key, a click, the wheel): the idle clock starts again, and a window shrunk aside
+        comes back and stays for a while."""
+        self._idle_since = time.monotonic()
+        if self._aside:  # a window event: already on the Tk thread
+            self._hands_off_until = time.monotonic() + self.ASIDE_HOLD_SECONDS
+            self._come_back()
+
+    def _maybe_back_to_standby(self, now: float) -> bool:
+        """True when the window has just been closed."""
+        gone = bool(self.daemon_gone)
+        if gone:  # what the service last said (lines working, jobs, unread) will never change now
+            idle = not self.muted and self.page == "transcript" and not self.typebox.value().strip() and self.card is None
+        else:
+            idle = self._idle_now()
+        if not idle:
+            self._idle_since = now
+            return False
+        minutes = float(getattr(self.cfg, "wake_idle_minutes", 0) or 5)
+        if now - self._idle_since < minutes * 60:
+            return False
+        log.info("idle %.0f min: back to standby", minutes)
+        if self.speaker is not None and not self.speaker.idle() and self.speaker.stuck():
+            log.warning("speech has not moved for over a minute (the sound card stopped taking audio?); closing anyway")
+        self._quit_requested = True
+        if self.daemon_gone or not getattr(self.client, "connected", True):
+            self.quit()  # nothing to shut down: just close (standby takes over)
+            return True
+        self._status("回到值守…")
+        # "keep": a timer never stops a job (one this window never heard about included)
+        threading.Thread(target=self._shutdown_for_quit, args=("keep", len(self._lines_snapshot[0]), True), daemon=True,
+                         name="standby").start()
+        return False
 
     def _quit_turned_down(self):
         """No bye long after the service's question: the answer was 不行 (or none), so the window stays."""
@@ -1766,6 +2223,7 @@ class App:
         self._show_back(False)
 
     def _wheel(self, event):
+        self._touched()  # the wheel is use too (this binding replaces the one in _bind_keys)
         w = self.root.winfo_containing(event.x_root, event.y_root)
         if w is not None and w.winfo_toplevel() is not self.root:
             return None  # a Combobox popdown: let it scroll its own list
@@ -1901,6 +2359,7 @@ class App:
                 self._insert_labelled("you", "你", s)
                 if textmod.fixed_phrase(s) == "open_access":  # "打开接入页" is a window action, not a daemon one
                     self._open_access()
+                    return True
             return
         self.textbox.configure(state="normal")
         self._retag_queued(False)
@@ -2070,7 +2529,8 @@ class App:
         t.set_size(self.font_size)
         t.apply_ttk_style()
         self._configure_tags()
-        self.root.minsize(t.min_w, t.min_h)
+        if not self._aside:  # shrunk to the corner: the normal minimum comes back with _come_back
+            self.root.minsize(t.min_w, t.min_h)
         self.band.configure(height=t.bar_h)
         self.orb.resize()
         self.chip.set(self.chip.name, self.chip.badge, self.chip.badge_kind, dark=self.chip.dark)
@@ -2148,6 +2608,12 @@ class App:
     def _tick_ui(self):
         """Everything that is derived from the current state: band colour, orb, buttons, hint, countdown."""
         now = time.monotonic()
+        self._tick_wake(now)
+        self._end_stuck_turn()
+        if self._aside and self.state != BUSY and not (self.state == APPROVING and self.turn_open):
+            self._come_back()  # the desktop work is over (a card asked mid-work: the approved step comes next)
+        if self.from_standby and self._maybe_back_to_standby(now):
+            return  # the window is gone
         state, conv, muted = self.state, self.conversation, self.muted
         raw = self._status_raw
         key = classify_status(raw)

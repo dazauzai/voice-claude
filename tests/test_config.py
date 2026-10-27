@@ -56,6 +56,18 @@ class SaveTests(unittest.TestCase):
         cfg = config.load(self.path)
         self.assertEqual((cfg.hold_seconds, cfg.start_with, cfg.manager_model), (1.2, "Atlas", "opus"))
 
+    def test_wake_section(self):
+        cfg = config.load(self.path)
+        self.assertEqual((cfg.wake_keyword, cfg.wake_threshold, cfg.wake_idle_minutes), ("hi chat", 0.15, 5.0))
+        self.path.write_text(SAMPLE + '\n[wake]\nkeyword = "你好助手"\nthreshold = 0.3\nidle_minutes = 2\n', "utf-8")
+        cfg = config.load(self.path)
+        self.assertEqual((cfg.wake_keyword, cfg.wake_threshold, cfg.wake_idle_minutes), ("你好助手", 0.3, 2.0))
+        self.path.write_text(SAMPLE + '\n[wake]\nkeyword = " "\n', "utf-8")
+        self.assertEqual(config.load(self.path).wake_keyword, "hi chat")  # an empty word: the default
+        example = config.load(config.ROOT / "config.example.toml")  # the example's values are the defaults
+        self.assertEqual((example.wake_keyword, example.wake_threshold, example.wake_idle_minutes), ("hi chat", 0.15, 5.0))
+        self.assertEqual(example.permissions["send_to_session"], "ask")
+
     def test_providers_section(self):
         from voiceclaude import access
         cfg = config.load(self.path)

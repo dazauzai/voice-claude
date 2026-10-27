@@ -111,6 +111,39 @@ class SettingsTests(unittest.TestCase):
         a._toggle_settings()  # the bar's 设置 / Ctrl+, close the whole area in one step
         self.assertEqual(a.page, "transcript")
 
+    def test_the_board_opens_for_the_active_line(self):
+        from voiceclaude import board_window
+        self.app.lines = {"p-1": {"name": "论文"}}
+        self.app.client = mock.Mock(active="p-1", connected=True)
+        with mock.patch.object(board_window, "open_board") as opened:
+            self.app._open_board()
+        opened.assert_called_once_with("p-1", "论文")
+
+    def test_a_line_that_wants_to_look_gets_its_board_opened(self):
+        from voiceclaude import board_window
+        self.app.lines = {"p-2": {"name": "日常"}}
+        self.app.client = mock.Mock(active="p-1", connected=True)
+        with mock.patch.object(board_window, "open_board") as opened:
+            self.app._on_daemon("board", {"line": "p-2", "want": "look"})
+            self.app._drain_ui()
+        opened.assert_called_once_with("p-2", "日常")
+
+    def test_the_window_has_the_mascot_icon(self):
+        self.assertTrue(appmod.ICON.is_file(), appmod.ICON)
+        with self.assertNoLogs(appmod.log, "WARNING"):  # Tk took the .ico (on Windows it reports nothing back)
+            self.app._set_icon()
+
+    def test_the_records_folder_opens_from_settings(self):
+        import tempfile
+        from pathlib import Path
+        from voiceclaude import paths
+        tmp = Path(tempfile.mkdtemp()) / "records"
+        opened = []
+        with mock.patch.object(paths, "RECORDS_DIR", tmp), mock.patch.object(appmod.os, "startfile", opened.append):
+            self.app._open_records()
+        self.assertEqual(opened, [str(tmp)])
+        self.assertTrue(tmp.is_dir())  # made on first open, so the folder is there to look at
+
     def test_settings_rows(self):
         a = self.app
         a._toggle_settings()

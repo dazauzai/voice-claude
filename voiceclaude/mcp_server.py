@@ -14,10 +14,12 @@ LINE = os.environ.get("VOICECLAUDE_LINE", "")
 server = MCPServer("voiceclaude", instructions="语音助手 voice-claude 自身的设置（字号、麦克风、扬声器、模型、权限）和后台任务。")
 
 
-def call(path: str, **data) -> str:
+def call(endpoint: str, /, **data) -> str:
+    """POST the tool's arguments to the service. The endpoint is positional-only: a tool argument may be called
+    `path` (board_show's image file) and must not collide with it."""
     if not PORT:
         return "语音助手没有在运行（VOICECLAUDE_PORT 未设置）。"
-    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/{path}", data=json.dumps({**data, "line": LINE}).encode("utf-8"),
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/{endpoint}", data=json.dumps({**data, "line": LINE}).encode("utf-8"),
                                  headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
@@ -29,6 +31,40 @@ def call(path: str, **data) -> str:
             return str(e)
     except Exception as e:
         return f"语音助手没有响应（{e}）。"
+
+
+def record(what: str, why: str, how: str, result: str = "", title: str = "") -> str:
+    """记一条（voice-claude 的长期记忆）：一个话题结束时，把这个项目里做了什么记下来，让每个项目的每个动作以后都能追溯，
+    换了模型也能接着做。what 是什么，why 为什么，how 怎么做，result 结果（没有就不填），title 可选（不给就用 what 的第一句）。
+    编号、时间和格式由程序加，不要自己去写记录文件。写具体的东西：名字、数字、文件、决定。
+    不记：密码、密钥、卡号、电话、邮箱、住址、证件号、账号 / 工单号 / 游戏 ID 这类标识、别人的全名、替用户发出去的消息原文，
+    说“那个工单”“对方”“那封邮件”就好。一个话题记一条，不用每轮都记；每项最多两千字左右，再长会截掉。"""
+    return call("record", what=what, why=why, how=how, result=result, title=title)
+
+
+def board_show(kind: str, content: str = "", path: str = "", title: str = "", near_id: str = "", shape: str = "") -> str:
+    """把东西放到这个项目的白板上（无边界的画布，用户也能在上面画、写、贴）。kind：
+    text：一张文字卡片，content 是文字（几行，一张卡一个意思；Markdown 的标题和加粗记号会去掉），title 可选；
+    image：一张图片，path 是你生成的 PNG 或 SVG 文件（最多 2 MB），title 可选，写在图下面；
+    shape：一个简单图形，shape 是 rectangle、ellipse 或 arrow，content 是写在上面的字。
+    会自动放在空的地方；near_id 给一个已有元素的 id（之前放东西时返回的），就挨着它放在右边。"""
+    return call("board_show", kind=kind, content=content, path=path, title=title, near_id=near_id, shape=shape)
+
+
+def board_look() -> str:
+    """看白板现在的样子（用户说“让它看”“你看看白板”时用）：返回一张截图的文件路径（用 Read 打开看图），和白板上全部文字的原文
+    （按位置从上到下）。然后根据用户画的、写的、贴的来回答。白板没开时会这么说，并列出白板上已有的文字。"""
+    return call("board_look")
+
+
+def board_clear() -> str:
+    """清空这个项目的白板（会先口头问用户；原来的内容留一份备份）。"""
+    return call("board_clear")
+
+
+if LINE not in ("manager", "scratch"):  # only project lines keep records and have a whiteboard
+    for _tool in (record, board_show, board_look, board_clear):
+        server.tool()(_tool)
 
 
 @server.tool()

@@ -1,0 +1,3 @@
+/* esm.sh - use-sidecar@1.1.3/dist/es2015/exports */
+import{__assign as d,__rest as n}from"../../../../tslib@_2.0.0/index.mjs";import*as i from"react";var a=function(r){var e=r.sideCar,o=n(r,["sideCar"]);if(!e)throw new Error("Sidecar: please provide `sideCar` property to import the right car");var t=e.read();if(!t)throw new Error("Sidecar medium not found");return i.createElement(t,d({},o))};a.isSideCarExport=!0;function p(r,e){return r.useMedium(e),a}export{p as exportSidecar};
+//# sourceMappingURL=exports.mjs.map

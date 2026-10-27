@@ -41,7 +41,10 @@ PERMISSION_LABELS = {
     "open_app": "打开程序", "switch_model": "切换模型", "batch": "一次批准一串步骤",
     "other_connectors": "账号里的其他连接器", "background_job": "后台运行命令", "switch_provider": "切换厂商",
     "codex_shell": "Codex 在沙箱外运行命令", "codex_edit": "Codex 改文件",
+    "send_to_session": "发消息给别的 Claude 会话",
 }
+# Asked out loud even in 通透模式 (transparent mode): the words go into another session, which acts on them.
+ALWAYS_ASK = {"send_to_session"}
 PERMISSION_VALUES = {"ask": "每次问", "allow": "不用问", "deny": "禁止"}
 DEFAULT_PERMISSIONS = {name: "ask" for name in PERMISSION_LABELS} | {"batch": "allow", "other_connectors": "deny"}
 
@@ -66,6 +69,8 @@ class Config:
     barge_in: bool = True
     duck_seconds: float = 0.3  # you talk this long over Claude -> its voice is lowered
     cut_seconds: float = 1.5  # ... this long -> its voice stops (the task keeps running)
+    min_level: float = 0.003  # sound counts as speech only above this level (RMS, 0..1; 0 = any) ...
+    level_ratio: float = 2.0  # ... and this many times the room's noise floor (0 = any)
     # [daemon] the background service that hosts the lines
     daemon_port: int = 0  # 0 = random
     max_lines: int = 3
@@ -86,11 +91,16 @@ class Config:
     speed: float = 1.0
     font_size: int = 11
     show_hints: bool = True  # [ui] the one-line shortcut hint under the buttons ("隐藏" in the window turns it off)
+    aside_for_desktop: bool = True  # [ui] the window shrinks to a corner while a line works on the desktop
     permissions: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_PERMISSIONS))
     transparent: bool = False  # [permissions] transparent: every "ask" goes through, except deleting and overwriting
     desktop_enabled: bool = True  # start the desktop-control MCP server at all ([desktop] enabled)
     desktop_apps: dict[str, str] = field(default_factory=dict)  # [desktop.apps]: name -> command, added to the built-in list
     replacements: dict[str, str] = field(default_factory=dict)
+    # [wake] the light standby mode: only the wake word listens; it opens the full window, which goes back when idle
+    wake_keyword: str = "hi chat"
+    wake_threshold: float = 0.15  # smaller = wakes more easily, and more often by mistake
+    wake_idle_minutes: float = 5.0
     resume: str = ""  # a Claude Code session id to continue (command line --resume), not from config.toml
 
 
@@ -101,6 +111,7 @@ def load(path: Path | None = None) -> Config:
     hk, au, cl, tts, ui, dm, mg = (data.get(k, {}) for k in ("hotkey", "audio", "claude", "tts", "ui", "daemon", "manager"))
     c.font_size = int(ui.get("font_size", c.font_size))
     c.show_hints = bool(ui.get("show_hints", c.show_hints))
+    c.aside_for_desktop = bool(ui.get("aside_for_desktop", c.aside_for_desktop))
     c.hotkey = str(hk.get("key", c.hotkey)).lower()
     c.send_key = str(hk.get("send_key", c.send_key)).lower()
     c.double_tap_seconds = float(hk.get("double_tap_seconds", c.double_tap_seconds))
@@ -111,6 +122,8 @@ def load(path: Path | None = None) -> Config:
     c.barge_in = bool(au.get("barge_in", c.barge_in))
     c.duck_seconds = float(au.get("duck_seconds", c.duck_seconds))
     c.cut_seconds = float(au.get("cut_seconds", c.cut_seconds))
+    c.min_level = float(au.get("min_level", c.min_level))
+    c.level_ratio = float(au.get("level_ratio", c.level_ratio))
     c.daemon_port = int(dm.get("port", c.daemon_port))
     c.max_lines = int(dm.get("max_lines", c.max_lines))
     c.idle_minutes = int(dm.get("idle_minutes", c.idle_minutes))
@@ -131,6 +144,10 @@ def load(path: Path | None = None) -> Config:
     c.desktop_enabled = bool(dt.get("enabled", c.desktop_enabled))
     c.desktop_apps = {str(k): str(v) for k, v in dt.get("apps", {}).items()}
     c.replacements = {str(k): str(v) for k, v in data.get("replacements", {}).items()}
+    wk = data.get("wake", {})
+    c.wake_keyword = str(wk.get("keyword", c.wake_keyword)).strip() or c.wake_keyword
+    c.wake_threshold = float(wk.get("threshold", c.wake_threshold))
+    c.wake_idle_minutes = float(wk.get("idle_minutes", c.wake_idle_minutes))
     c.transparent = bool(data.get("permissions", {}).get("transparent", False))
     for name, value in data.get("permissions", {}).items():
         if name in PERMISSION_LABELS and normalize_permission_value(value):

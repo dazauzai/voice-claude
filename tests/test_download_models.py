@@ -89,10 +89,32 @@ class DownloadTests(unittest.TestCase):
                 dm.safe_extract(tar, self.dest)
 
     def test_nothing_to_do(self):
-        for t in dm.MODEL_SOURCES:
+        for t in list(dm.MODEL_SOURCES) + [dm.KWS]:
             (self.dest / t).mkdir()
         self.assertEqual(dm.main(["--yes", "--dest", str(self.dest)]), 0)
         self.assertEqual(self.fetched, [])
+
+    def test_the_wake_word_model_keeps_only_what_wake_py_loads(self):
+        import io
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:bz2") as tar:
+            for name in list(dm.KWS_FILES) + ["encoder-epoch-13-avg-2-chunk-16-left-64.onnx", "test_wavs/zh_0.wav"]:
+                info = tarfile.TarInfo(f"{dm.KWS}/{name}")
+                info.size = 3
+                tar.addfile(info, io.BytesIO(b"abc"))
+        archive = buf.getvalue()
+        with mock.patch.object(dm, "fetch", lambda url, dest, size=None, show=True: dest.write_bytes(archive)):
+            dm.kws_from_github(self.dest)
+        self.assertEqual(sorted(p.name for p in (self.dest / dm.KWS).iterdir()), sorted(dm.KWS_FILES))
+        self.assertEqual(sorted(p.name for p in self.dest.iterdir()), [dm.KWS])  # no archive, no .extract folder
+
+    def test_no_github_skips_only_the_wake_word(self):
+        self.mode = "unreachable"
+        for t in dm.MODEL_SOURCES:
+            (self.dest / t).mkdir()
+        self.assertEqual(dm.main(["--yes", "--dest", str(self.dest)]), 0)  # the rest is installed, so it is fine
+        self.assertFalse((self.dest / dm.KWS).exists())
 
     def test_auto_source(self):
         with mock.patch.object(dm, "reachable", lambda url, timeout=8.0: 0.5):

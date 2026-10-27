@@ -28,6 +28,12 @@ English: [guide.en.md](guide.en.md)
 
 也可以打字：窗口下方的输入框，回车发送，Shift+回车换行。打的字和说的话走同一条路：它正在回答时会排队，"回到总机"这类固定说法照样有效（要单独说，前面可以带"好""能不能""帮我"；夹在一句话里时当普通的话发给模型），有申请卡时打"可以""不行"就是在回答申请。
 
+值守和唤醒词：双击 `standby.bat` 进入值守——只开着麦克风听唤醒词（默认"hi chat"，在 config.toml 的 `[wake]` 里改；中文唤醒词要先装 pypinyin），大约占一个 CPU 核的 1%。听到唤醒词会"叮"一声，几秒后打开窗口直接开始听你说；窗口空闲 5 分钟（`idle_minutes`）后自己关掉，回到值守。窗口开着、空闲时说唤醒词也一样开始听。设置页「唤醒词」里可以打开「开机自动进入值守」（在 Windows 的"启动"文件夹放一个快捷方式），或者点「现在进入值守」。唤醒词全在本机识别，听到之前什么都不发出去；Windows 会一直显示麦克风在用。唤醒词模型只能从 GitHub 下载，install.bat 连不上 GitHub 时会跳过它，其他照常。
+
+发给桌面应用里的其他 Claude 会话：说"跟论文写作辅助说：……"（用 Claude 桌面应用 Code 标签里会话的名字），线路会先问你一次"我想发给「论文写作辅助」：……，可以吗？"，同意后原话发过去；对方的回答会以它的名字显示在对话记录里并念出来。权限页的「发给其他 Claude 会话」可以改成允许或禁止；通透模式不跳过这一问。只能发给 Code 标签里的会话，claude.ai 聊天里的对话收不到。
+
+用量：每轮回答下面有一行小字（这一轮的输入、输出 token，Claude 线路还有按标价折算的费用）；设置页的「用量」一组有今天和本次启动的合计，用 Claude 订阅时还有 5 小时和本周额度用了多少、什么时候重置；说"用量怎么样"会念出来。额度快用完时会提醒。
+
 撤回：单独说或打"撤回上一句"（可以连着用；"把那个提交撤回"这种照常发给模型），或者右键点对话记录里你说过的某一句 →「从这里重来」。对话回到那句之前，那句话放回输入框；撤掉的几轮改过文件时会先问要不要一起改回去（Codex 线路只能撤回对话）。
 
 ### 窗口
@@ -46,7 +52,7 @@ English: [guide.en.md](guide.en.md)
 
 窗口拉到 640 逻辑像素以上宽时，左边多一栏常驻的线路和后台任务，对话列封顶在 38 个汉字宽、居中。
 
-设置页（点"设置"或 Ctrl+,，[截图](ui/preview-settings.png)、[下半部分](ui/preview-settings-bottom.png)）在同一张白卡里：最上面是「AI 服务商」和「权限」两个子页的入口，下面是麦克风、扬声器、字号、始终置顶、快捷键提示、配置文件，最底下是"退出 voice-claude"。
+设置页（点"设置"或 Ctrl+,，[截图](ui/preview-settings.png)、[下半部分](ui/preview-settings-bottom.png)）在同一张白卡里：最上面是「AI 服务商」和「权限」两个子页的入口，下面是麦克风、扬声器、字号、始终置顶、操作桌面时缩到角落（线路截图、点击时窗口缩成小条移到右下角，不挡它要点的地方；做完或你一碰窗口就恢复，`[ui] aside_for_desktop`）、快捷键提示、配置文件、白板（见下）、记录（打开 `~/.voice-claude/records/`：每个项目一份 `.md`，是 voice-claude 的长期记忆——线路在一个话题结束时记一条「是什么、为什么、怎么做、结果」，换模型或重开时会读回去），最底下是"退出 voice-claude"。
 
 - 「权限」子页（[截图](ui/preview-permissions.png)）：最上面是通透模式开关（见下面"桌面控制"）；下面每项"询问 / 允许 / 禁止"，点一个新值等于替你说一句"把点击的权限改成允许"，照常口头确认。
 - 「AI 服务商」页（[截图](ui/preview-access.png)；说"打开 AI 服务商"也能打开）：选谁来答话、填各家的 key、用 Claude Code 或 Codex 登录；一家都连不上时会自动弹出。
@@ -114,7 +120,7 @@ python -m venv .venv
 
 - `hotkey.key`：主键，默认 `right ctrl`。可选 `left ctrl`、`pause`、`scroll lock`、`f13`–`f24`。Shift（输入法切中/英、粘滞键）、Caps Lock（切大写）、Insert（改写模式）单独按都有副作用，所以不提供。`hotkey.send_key`：第二个键（静音 / 马上发 / 申请时的"可以"），默认 `right alt`，留空就不用。`hotkey.hold_seconds`：按住多久算紧急停止，默认 0.8 秒。
 - `audio.microphone` / `audio.speaker`：留空用 Windows 默认设备，或填名字的一部分（如 `"USB"`、`"Realtek"`）。启动时窗口会显示当前用的设备，并说一句"准备好了"；听不到就改这里。
-- `audio.silence_seconds`：停顿多久算说完。`audio.barge_in`：用外放时改成 `false`。`audio.duck_seconds` / `cut_seconds`：你开口多久后它的声音压低、停掉。
+- `audio.silence_seconds`：停顿多久算说完。`audio.barge_in`：用外放时改成 `false`。`audio.duck_seconds` / `cut_seconds`：你开口多久后它的声音压低、停掉。`audio.min_level` / `level_ratio`：多响才算说话（至少这个音量，且比环境噪音响这么多倍）；噪音误触发就调大，都填 0 不过滤。
 - `claude.model` / `claude.effort`：项目线路用的模型和思考深度。示例默认 `opus` + `low`（开放性问题约 3 秒开始说；`medium` / `high` 更深但更慢）。可以写 `opus`、`sonnet`、`fable` 或完整型号名；也可以口头说"切到 sonnet"，它会先问你再切，对话保留。总机用 `[manager]` 里单独的模型（默认 `sonnet`；总机在别家上时用那家的模型），不受影响。
 - `[manager] engine`：总机的脑子，`auto` = 能连上模型就用它，否则用不需要模型的规则总机。总机的提示词可以用 `~/.voice-claude/manager-prompt.md` 覆盖。
 - `[providers]`：谁来答话（`claude` / `deepseek` / `kimi` / `openai`）和各家用的模型名；key 不在这里，在「AI 服务商」页填。口头"切到 DeepSeek / 换成 GPT / 用 Claude"会先问你；对总机说是换默认，对项目线说只换那一条。
@@ -210,6 +216,17 @@ scripts/     安装、下载模型、自检、前台假后台、截图
 ## 卸载
 
 删掉程序文件夹（里面有 `.venv` 和 `models`）和 `~/.voice-claude`。如果后台服务曾经经任务计划程序启动，再运行 `schtasks /delete /tn voice-claude-daemon /f`。
+
+## 白板
+
+说"打开白板"（或设置页 → 白板 → 打开），当前项目的白板在独立窗口里打开：一块无边界的画布（[Excalidraw](https://github.com/excalidraw/excalidraw)），每个项目一块，存在 `~/.voice-claude/boards/`。
+
+- **它放**：线路可以把一段文字、一张它生成的图（SVG / PNG）、一个简单图形放到白板上；窗口会滚到新放的东西那里。
+- **你放**：画笔、文字、形状、贴图都是 Excalidraw 自己的工具（鼠标、手写板、触屏都行）。
+- **让它看**：右下角的"让它看"把当前视野截成图，连同图里所有文字的原文一起交给线路；线路自己也可以要看（白板没开时窗口会替它打开）。
+- 清空白板要先问你，清空前会留一份备份。
+
+白板窗口的标题以"— voice-claude"结尾，桌面控制把它当成自己的窗口：不会去点它，截图里会标出来。
 
 ## 许可证
 

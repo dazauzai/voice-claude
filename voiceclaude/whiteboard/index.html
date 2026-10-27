@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>白板 — voice-claude</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="./vendor/assets/index.css">
+<style>
+  html, body, #app { margin: 0; height: 100%; overflow: hidden; }
+  #look { position: fixed; right: 16px; bottom: 16px; z-index: 20; padding: 10px 18px; border: 0; border-radius: 8px;
+          background: #6965db; color: #fff; font: 15px system-ui, "Microsoft YaHei", sans-serif; cursor: pointer;
+          box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+  #look:disabled { background: #a5a3ea; cursor: default; }
+  #state { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 20; padding: 6px 14px;
+           border-radius: 6px; background: rgba(30,30,30,.85); color: #fff; font: 13px system-ui, "Microsoft YaHei", sans-serif;
+           opacity: 0; transition: opacity .3s; pointer-events: none; }
+  #state.show { opacity: 1; }
+</style>
+<script>window.EXCALIDRAW_ASSET_PATH = "./vendor/assets/";</script>
+<script src="./vendor/shim/react.production.min.js"></script>
+<script src="./vendor/shim/react-dom.production.min.js"></script>
+<script type="importmap">{"imports": {
+  "react": "./vendor/shim/react.js",
+  "react-dom": "./vendor/shim/react-dom.js",
+  "react/jsx-runtime": "./vendor/shim/react-jsx-runtime.js",
+  "react-dom/client": "./vendor/shim/react-dom-client.js"
+}}</script>
+</head>
+<body>
+<div id="app"></div>
+<button id="look" type="button">让它看</button>
+<div id="state"></div>
+<script type="module" src="./board.js"></script>
+</body>
+</html>

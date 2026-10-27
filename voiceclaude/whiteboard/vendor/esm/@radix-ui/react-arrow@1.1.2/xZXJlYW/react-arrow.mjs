@@ -1,0 +1,3 @@
+/* esm.sh - @radix-ui/react-arrow@1.1.2 */
+import*as e from"react";import{Primitive as p}from"../../react-primitive@2.0.2/xZXJlYW/react-primitive.mjs";import{jsx as o}from"react/jsx-runtime";var v="Arrow",i=e.forwardRef((r,t)=>{let{children:a,width:s=10,height:m=5,...n}=r;return o(p.svg,{...n,ref:t,width:s,height:m,viewBox:"0 0 30 10",preserveAspectRatio:"none",children:r.asChild?a:o("polygon",{points:"0,0 30,0 15,10"})})});i.displayName=v;var f=i;export{i as Arrow,f as Root};
+//# sourceMappingURL=react-arrow.mjs.map
